@@ -1,0 +1,16 @@
+{
+  "name": "Vidyarthi — విద్యార్థి",
+  "short_name": "Vidyarthi",
+  "description": "Vidyarthi is a fun, friendly app for kids to learn to trace and write Telugu letters, set in a sky full of kites, rainbows and a unicorn friend.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#4FA8F0",
+  "theme_color": "#4FA8F0",
+  "icons": [
+    { "src": "assets/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "assets/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "assets/icons/icon-512-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
