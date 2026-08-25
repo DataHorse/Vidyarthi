@@ -116,14 +116,14 @@
       </div>
       <h1 class="display"><span class="tel">విద్యార్థి</span></h1>
       <p class="app-name-en">Vidyarthi</p>
-      <p class="subtitle">Tap a letter to learn and trace it!</p>
+      <p class="subtitle">Pick a lesson to learn and trace!</p>
       <div class="star-total" id="star-total" aria-live="polite">
         <span class="icon" style="color:var(--accent-yellow)"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 2.5l2.9 6.3 6.9.7-5.2 4.7 1.5 6.8L12 17.6 5.9 21l1.5-6.8L2.2 9.5l6.9-.7L12 2.5Z"/></svg></span>
-        <span id="star-total-count">0</span> / <span id="star-total-max">51</span>
+        <span id="star-total-count">0</span> / <span id="star-total-max">592</span>
       </div>
     </header>
 
-    <div id="letter-grid-wrap">
+    <div id="lesson-list-wrap">
       <!-- filled by app.js -->
     </div>
 
@@ -136,12 +136,30 @@
   <section id="practice-screen" class="screen hidden" aria-label="Practice a letter">
 
     <header class="practice-header">
-      <button id="btn-home" class="icon-btn" aria-label="Back to letter list">
+      <button id="btn-home" class="icon-btn" aria-label="Back to lessons">
         <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.5 12 4l9 7.5"/><path d="M5.5 10v9a1 1 0 0 0 1 1H10v-5.5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V20h3.5a1 1 0 0 0 1-1v-9"/></svg></span>
       </button>
-      <div class="progress-pill" id="progress-pill">1 / 51</div>
-      <div class="group-pill" id="group-pill">Vowels</div>
+      <button class="progress-pill" id="progress-pill" aria-label="Jump to another letter in this lesson" aria-haspopup="dialog">1 / 4</button>
+      <button class="group-pill" id="group-pill" aria-label="Jump to another letter in this lesson" aria-haspopup="dialog">Lesson 1</button>
     </header>
+
+    <!-- Letter picker: jump to any other character in the CURRENT lesson,
+         without leaving the practice screen or losing this lesson's context. -->
+    <div class="lesson-picker-overlay hidden" id="lesson-picker-overlay" role="dialog" aria-modal="true" aria-label="Jump to a letter in this lesson">
+      <div class="lesson-picker-backdrop" id="lesson-picker-backdrop"></div>
+      <div class="lesson-picker-card">
+        <div class="lesson-picker-header">
+          <div>
+            <div class="lesson-picker-title" id="lesson-picker-title">Lesson 1</div>
+            <div class="lesson-picker-subtitle" id="lesson-picker-subtitle">Tap a letter to jump to it</div>
+          </div>
+          <button id="lesson-picker-close" class="icon-btn small" aria-label="Close">
+            <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6l12 12M18 6 6 18"/></svg></span>
+          </button>
+        </div>
+        <div class="lesson-picker-grid" id="lesson-picker-grid"><!-- filled by app.js --></div>
+      </div>
+    </div>
 
     <div class="letter-info-row">
       <div class="big-letter-preview tel" id="big-letter-preview">అ</div>
@@ -162,6 +180,18 @@
         </div>
         <div class="note-row hidden" id="note-row"></div>
       </div>
+    </div>
+
+    <div class="mode-toggle" id="mode-toggle">
+      <button id="mode-trace" class="mode-btn active" aria-label="Trace mode: draw over the dotted outline">
+        <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17c2-1 3-4 4-6 1.5-3 2.5-3 4 0 1 2 2 5 4 6M3 20h18" stroke-dasharray="2 2.2"/></svg></span>
+        Trace
+      </button>
+      <button id="mode-practice" class="mode-btn" aria-label="Practice mode: draw the letter from memory and get a match score">
+        <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l2.6 5.9 6.4.6-4.8 4.3 1.4 6.3L12 16.9 6.4 20.1l1.4-6.3-4.8-4.3 6.4-.6L12 3Z"/></svg></span>
+        Practice
+      </button>
+      <span class="practice-best hidden" id="practice-best"></span>
     </div>
 
     <div class="canvas-stage">
@@ -202,7 +232,7 @@
                 <path d="M68 107 Q75 116 82 107" fill="none" stroke="#3A3358" stroke-width="2.2" stroke-linecap="round"/>
               </svg>
             </div>
-            <div class="celebrate-text">Great job!</div>
+            <div class="celebrate-text" id="celebrate-text">Great job!</div>
           </div>
         </div>
       </div>
@@ -223,7 +253,7 @@
       </button>
       <button id="btn-done" class="control-btn done">
         <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8 12.5l2.5 2.5 5.5-6"/></svg></span>
-        I'm done!
+        <span id="btn-done-label">Check it!</span>
       </button>
     </div>
 

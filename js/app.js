@@ -3,12 +3,78 @@
   "use strict";
 
   const STORAGE_KEY = "vidyarthi-progress-v1";
+  const PRACTICE_KEY = "vidyarthi-practice-best-v1";
+  const CHAPTER_UI_KEY = "vidyarthi-chapter-ui-v1";
   const PEN_COLORS = ["#FF5D8F", "#3DA9FF", "#21BFA6", "#FFC93C", "#8C6BFF", "#33314A"];
+
+  // Trace-accuracy scoring thresholds. Drawing is sampled onto a small
+  // (SCORE_SIZE x SCORE_SIZE) grid and compared against masks built from the
+  // same glyph (see buildMasks). See scoreDrawing() below.
+  const SCORE_SIZE = 96;
+  const MIN_INK_PIXELS = 45; // below this, treat as "didn't really draw"
+  const COVERAGE_MIN = 0.3; // fraction of the letter's *core* that got inked
+  const PRECISION_MIN = 0.38; // fraction of the child's ink that landed on the letter
+  // coverage and precision are independent tests ("inked *some* of the real
+  // shape" and "stayed *mostly* on the real shape"), so a scribble spread
+  // across most of the drawing box can clear both at once purely by
+  // covering a lot of ground — moderate-moderate on each axis, without
+  // actually being the right shape. PASS_MATCH_MIN adds the same guard
+  // percentScore() below uses for Practice mode (their product, which needs
+  // BOTH numbers genuinely good at once) to Trace mode's pass/retry gate too.
+  const PASS_MATCH_MIN = 48;
+  const DILATE_RATIO = 0.16; // forgiving halo around the glyph's true strokes,
+  // as a fraction of SCORE_SIZE — generous enough for a kid's wobbly,
+  // uneven-thickness line, without losing the letter's actual shape.
+
+  // The printed guide glyph is drawn very bold (font-weight 900) so it reads
+  // clearly on screen, but a real pen stroke — even a careful, accurate one —
+  // is nowhere near that thick, so it can never fill a bold glyph's full
+  // interior. Grading coverage against the full bold shape quietly capped
+  // even a genuinely good trace's score well below what it visually deserved
+  // (a drawing that looked like a clean 90% match could score ~60%).
+  // CORE_WEIGHT builds a second, *thinner*-stroke rendering of the very same
+  // glyph (same size, same position) purely as coverage's target — it asks
+  // "did the ink pass through the letter's own stroke path?" instead of "did
+  // the ink fill this bold glyph edge-to-edge?". The glyph's actual bold
+  // rendering (and a halo around it) is still what precision is graded
+  // against, so ink that strays off the true shape is still marked down.
+  const CORE_WEIGHT = 500;
+
+  // A real hand-drawn letter — especially on a touch screen, especially with
+  // no printed outline underneath in Practice mode — is essentially never the
+  // same size or position as the printed glyph, and its proportions can be a
+  // bit taller/shorter or narrower/wider too. Rather than score that as
+  // "wrong", scoreDrawing() re-fits the child's own ink onto the glyph's own
+  // ink bounding box (independently per axis) before comparing shapes, so
+  // grading tracks "is this legibly the right letter" rather than "does this
+  // match the printed size/position exactly". Two guards keep that from being
+  // gameable: NORMALIZE_MIN_EXTENT_RATIO refuses to stretch an axis that's
+  // still too thin to be a real stroke (so a stray dot/tap can't be blown up
+  // into "filled the box"), and NORMALIZE_MAX_SCALE caps how far anything can
+  // be stretched either way.
+  const NORMALIZE_MIN_EXTENT_RATIO = 0.15;
+  const NORMALIZE_MAX_SCALE = 4;
+
+  const SUCCESS_MESSAGES = ["Great job!", "Wonderful!", "You did it!", "Super tracing!", "Amazing!"];
+  const RETRY_MESSAGES = [
+    "Nice try! Let's trace it again.",
+    "Almost there — try once more!",
+    "Keep going — trace inside the lines!",
+    "So close! One more try!",
+  ];
+  const EMPTY_MESSAGES = ["Try tracing the letter first!", "Draw over the dotted letter to begin!"];
+  const PRACTICE_EMPTY_MESSAGES = ["Draw the letter from memory to see your score!", "Give it a try — draw the letter in the box!"];
+
+  // "Practice" mode: a blank box (no outline) where a percentage match score
+  // replaces the pass/retry messaging, so a child can test how well they've
+  // memorized a letter's shape after tracing it a few times.
+  const PRACTICE_GREAT_MIN = 78; // >= this: celebrate + confetti
+  const PRACTICE_OK_MIN = 45; // >= this: encouraging, but no confetti
 
   // ---------- Elements ----------
   const homeScreen = document.getElementById("home-screen");
   const practiceScreen = document.getElementById("practice-screen");
-  const gridWrap = document.getElementById("letter-grid-wrap");
+  const lessonListWrap = document.getElementById("lesson-list-wrap");
   const starTotalCount = document.getElementById("star-total-count");
   const starTotalMax = document.getElementById("star-total-max");
 
@@ -17,11 +83,18 @@
   const btnNext = document.getElementById("btn-next");
   const btnClear = document.getElementById("btn-clear");
   const btnDone = document.getElementById("btn-done");
+  const btnDoneLabel = document.getElementById("btn-done-label");
   const btnSayLetter = document.getElementById("btn-say-letter");
   const btnSayWord = document.getElementById("btn-say-word");
 
   const progressPill = document.getElementById("progress-pill");
   const groupPill = document.getElementById("group-pill");
+  const lessonPickerOverlay = document.getElementById("lesson-picker-overlay");
+  const lessonPickerBackdrop = document.getElementById("lesson-picker-backdrop");
+  const lessonPickerClose = document.getElementById("lesson-picker-close");
+  const lessonPickerTitle = document.getElementById("lesson-picker-title");
+  const lessonPickerSubtitle = document.getElementById("lesson-picker-subtitle");
+  const lessonPickerGrid = document.getElementById("lesson-picker-grid");
   const bigLetterPreview = document.getElementById("big-letter-preview");
   const translitLabel = document.getElementById("translit-label");
   const wordTel = document.getElementById("word-tel");
@@ -31,6 +104,10 @@
   const noteRow = document.getElementById("note-row");
   const colorRow = document.getElementById("color-row");
   const celebrateOverlay = document.getElementById("celebrate-overlay");
+  const celebrateText = document.getElementById("celebrate-text");
+  const modeTraceBtn = document.getElementById("mode-trace");
+  const modePracticeBtn = document.getElementById("mode-practice");
+  const practiceBestBadge = document.getElementById("practice-best");
 
   const guideCanvas = document.getElementById("guide-canvas");
   const drawCanvas = document.getElementById("draw-canvas");
@@ -39,10 +116,18 @@
   const drawCtx = drawCanvas.getContext("2d");
 
   // ---------- State ----------
-  let currentIndex = 0;
+  let currentLesson = LESSONS[0];
+  let letterIndex = 0; // index within currentLesson.letters
   let currentColor = PEN_COLORS[0];
   let drawing = false;
   let lastPoint = null;
+  let hasInk = false; // fast-path flag so an empty canvas never needs pixel sampling
+  let busyGrading = false; // guards against double-taps on "I'm done"
+  let practiceMode = false; // false = Trace (guided), true = Practice (blank, from memory)
+
+  function currentLetter() {
+    return currentLesson.letters[letterIndex];
+  }
 
   // ---------- Progress (localStorage) ----------
   function loadProgress() {
@@ -69,42 +154,203 @@
   function practicedCount() {
     return Object.keys(progress).filter((k) => progress[k]).length;
   }
+  function lessonPracticedCount(lesson) {
+    return lesson.letters.filter((l) => progress[l.id]).length;
+  }
 
-  // ---------- Home screen: build letter grid grouped by teaching section ----------
-  function buildHomeGrid() {
-    gridWrap.innerHTML = "";
-    let currentGroup = null;
-    let section = null;
-    let grid = null;
+  // ---------- Chapter expand/collapse (localStorage) ----------
+  // Only ever holds a chapter id once the child has EXPLICITLY tapped its
+  // header — until then a chapter's expanded/collapsed state is computed
+  // fresh each time (see buildLessonList), so newly-earned progress keeps
+  // steering which chapter opens by default.
+  function loadChapterUI() {
+    try {
+      const raw = localStorage.getItem(CHAPTER_UI_KEY);
+      return raw ? JSON.parse(raw) : {};
+    } catch (e) {
+      return {};
+    }
+  }
+  function saveChapterUI(overrides) {
+    try {
+      localStorage.setItem(CHAPTER_UI_KEY, JSON.stringify(overrides));
+    } catch (e) {
+      /* ignore (private browsing etc.) */
+    }
+  }
 
-    LETTERS.forEach((letter, idx) => {
-      if (letter.group !== currentGroup) {
-        currentGroup = letter.group;
-        section = document.createElement("div");
-        section.className = "group-section";
-        const title = document.createElement("h2");
-        title.className = "group-title";
-        title.innerHTML =
-          '<span class="icon"><svg viewBox="0 0 40 40"><g fill="#FF6FA5"><ellipse cx="20" cy="9" rx="6" ry="9"/><ellipse cx="31" cy="20" rx="9" ry="6"/><ellipse cx="20" cy="31" rx="6" ry="9"/><ellipse cx="9" cy="20" rx="9" ry="6"/></g><circle cx="20" cy="20" r="6" fill="#FFD54B"/></svg></span>' +
-          `<span>${currentGroup}</span>`;
-        section.appendChild(title);
-        grid = document.createElement("div");
-        grid.className = "letter-grid";
-        section.appendChild(grid);
-        gridWrap.appendChild(section);
+  // ---------- Practice-mode best scores (localStorage, separate from trace progress) ----------
+  function loadPracticeBest() {
+    try {
+      const raw = localStorage.getItem(PRACTICE_KEY);
+      return raw ? JSON.parse(raw) : {};
+    } catch (e) {
+      return {};
+    }
+  }
+  function savePracticeBest() {
+    try {
+      localStorage.setItem(PRACTICE_KEY, JSON.stringify(practiceBest));
+    } catch (e) {
+      /* ignore (private browsing etc.) */
+    }
+  }
+  let practiceBest = loadPracticeBest();
+
+  function recordPracticeScore(id, pct) {
+    if (typeof practiceBest[id] !== "number" || pct > practiceBest[id]) {
+      practiceBest[id] = pct;
+      savePracticeBest();
+    }
+  }
+
+  // ---------- Home screen: build the Lessons list ----------
+  function buildLessonCard(lesson) {
+    const done = lessonPracticedCount(lesson);
+    const total = lesson.letters.length;
+    const complete = done === total;
+
+    const card = document.createElement("button");
+    card.className = "lesson-card";
+    card.setAttribute("aria-label", `${lesson.title}: ${lesson.subtitle}`);
+
+    const num = document.createElement("div");
+    num.className = "lesson-num";
+    num.textContent = String(lesson.id + 1);
+
+    const body = document.createElement("div");
+    body.className = "lesson-card-body";
+
+    const titleRow = document.createElement("div");
+    titleRow.className = "lesson-title-row";
+    const title = document.createElement("div");
+    title.className = "lesson-title";
+    title.textContent = lesson.title;
+    const stars = document.createElement("div");
+    stars.className = "lesson-stars";
+    stars.textContent = `${done} / ${total} ⭐`;
+    titleRow.appendChild(title);
+    titleRow.appendChild(stars);
+
+    const subtitle = document.createElement("div");
+    subtitle.className = "lesson-subtitle";
+    subtitle.textContent = lesson.subtitle;
+
+    const preview = document.createElement("div");
+    preview.className = "lesson-preview";
+    let curCluster = null;
+    let clusterEl = null;
+    lesson.letters.forEach((letter) => {
+      if (letter.cluster !== curCluster) {
+        curCluster = letter.cluster;
+        clusterEl = document.createElement("span");
+        clusterEl.className = "cluster-group";
+        preview.appendChild(clusterEl);
       }
-      const tile = document.createElement("button");
-      tile.className = "letter-tile tel" + (progress[letter.id] ? " practiced" : "");
-      tile.setAttribute("aria-label", `${letter.translit} letter`);
-      const starBadge = progress[letter.id]
-        ? '<svg class="star-badge" viewBox="0 0 24 24"><path fill="#FFC93D" stroke="#fff" stroke-width="1.5" stroke-linejoin="round" d="M12 2.5l2.9 6.3 6.9.7-5.2 4.7 1.5 6.8L12 17.6 5.9 21l1.5-6.8L2.2 9.5l6.9-.7L12 2.5Z"/></svg>'
-        : "";
-      tile.innerHTML = letter.telugu + starBadge;
-      tile.addEventListener("click", () => {
-        currentIndex = idx;
-        showPracticeScreen();
+      const tile = document.createElement("span");
+      tile.className = "mini-tile tel" + (progress[letter.id] ? " practiced" : "");
+      tile.textContent = letter.telugu;
+      clusterEl.appendChild(tile);
+    });
+
+    body.appendChild(titleRow);
+    body.appendChild(subtitle);
+    body.appendChild(preview);
+
+    card.appendChild(num);
+    card.appendChild(body);
+
+    if (complete) {
+      card.insertAdjacentHTML(
+        "beforeend",
+        '<svg class="lesson-check" viewBox="0 0 24 24"><circle cx="12" cy="12" r="11" fill="#43B26D" stroke="#fff" stroke-width="2"/><path d="M7.5 12.5l3 3 6-6.5" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+      );
+    }
+
+    card.addEventListener("click", () => {
+      currentLesson = lesson;
+      // Resume at the first not-yet-practiced letter in the lesson, so
+      // returning kids pick up where they left off.
+      const resumeAt = lesson.letters.findIndex((l) => !progress[l.id]);
+      letterIndex = resumeAt === -1 ? 0 : resumeAt;
+      showPracticeScreen();
+    });
+
+    return card;
+  }
+
+  // Lessons are grouped into Chapters (Chapter 1: the alphabet itself,
+  // Chapter 2: each consonant's full గుణింతం row of vowel-sign
+  // combinations) — each chapter gets its own heading and its own
+  // "card list", so a child (or parent) can see the two kinds of practice
+  // as clearly separate sections rather than one long undifferentiated list.
+  //
+  // To keep the home screen from feeling overwhelming (48 lessons total),
+  // each chapter's list can collapse to just its header. By default, the
+  // chapter a child is *currently working through* (the first one that
+  // isn't 100% complete, in chapter order) opens automatically and the
+  // rest stay tucked away — but a tap on any header always toggles that
+  // one chapter, and that explicit choice is remembered (localStorage)
+  // and wins over the default from then on.
+  function buildLessonList() {
+    lessonListWrap.innerHTML = "";
+
+    const chapterOverrides = loadChapterUI();
+
+    const chapterStats = CHAPTERS.map((chapter) => {
+      const lessons = LESSONS.filter((l) => l.chapter === chapter.id);
+      const totalLetters = lessons.reduce((sum, l) => sum + l.letters.length, 0);
+      const doneLetters = lessons.reduce((sum, l) => sum + lessonPracticedCount(l), 0);
+      return { chapter, lessons, totalLetters, doneLetters, complete: totalLetters > 0 && doneLetters === totalLetters };
+    });
+    // The chapter currently "in progress": the first, in chapter order,
+    // that isn't finished yet. If every chapter is complete, none gets an
+    // automatic default — everything stays tucked away for a tidy "all
+    // done" view (still one tap away to reopen and review).
+    const inProgress = chapterStats.find((s) => !s.complete);
+
+    chapterStats.forEach(({ chapter, lessons, doneLetters, totalLetters, complete }) => {
+      if (!lessons.length) return;
+
+      const doneLessons = lessons.filter((l) => lessonPracticedCount(l) === l.letters.length).length;
+      const defaultExpanded = !!inProgress && inProgress.chapter.id === chapter.id;
+      const hasOverride = Object.prototype.hasOwnProperty.call(chapterOverrides, chapter.id);
+      const expanded = hasOverride ? chapterOverrides[chapter.id] : defaultExpanded;
+      const listId = `chapter-list-${chapter.id}`;
+
+      const header = document.createElement("button");
+      header.type = "button";
+      header.className = "chapter-header" + (expanded ? " expanded" : "");
+      header.setAttribute("aria-expanded", String(expanded));
+      header.setAttribute("aria-controls", listId);
+      header.innerHTML = `
+        <div class="chapter-heading">
+          <div class="chapter-title">${chapter.title}</div>
+          <div class="chapter-subtitle">${chapter.subtitle}</div>
+        </div>
+        <div class="chapter-header-right">
+          <div class="chapter-progress">${doneLessons} / ${lessons.length} lessons</div>
+          <span class="chapter-chevron" aria-hidden="true">▾</span>
+        </div>
+      `;
+
+      const list = document.createElement("div");
+      list.id = listId;
+      list.className = "lesson-list" + (expanded ? "" : " collapsed");
+      lessons.forEach((lesson) => list.appendChild(buildLessonCard(lesson)));
+
+      header.addEventListener("click", () => {
+        const nowExpanded = list.classList.contains("collapsed");
+        list.classList.toggle("collapsed", !nowExpanded);
+        header.classList.toggle("expanded", nowExpanded);
+        header.setAttribute("aria-expanded", String(nowExpanded));
+        const overrides = loadChapterUI();
+        overrides[chapter.id] = nowExpanded;
+        saveChapterUI(overrides);
       });
-      grid.appendChild(tile);
+
+      lessonListWrap.appendChild(header);
+      lessonListWrap.appendChild(list);
     });
 
     starTotalCount.textContent = practicedCount();
@@ -112,7 +358,8 @@
   }
 
   function showHomeScreen() {
-    buildHomeGrid();
+    closeLessonPicker();
+    buildLessonList();
     practiceScreen.classList.add("hidden");
     homeScreen.classList.remove("hidden");
     window.scrollTo(0, 0);
@@ -126,7 +373,7 @@
   let lastCanvasSize = { w: 0, h: 0 };
 
   function setupCanvasSize(preserveDrawing) {
-    const rect = canvasWrap.getBoundingClientRect();
+    const rect = guideCanvas.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
 
     // If the canvas is genuinely being resized (e.g. device rotation) and asked
@@ -158,32 +405,93 @@
     return rect;
   }
 
+  // Computes a font size + visually-centered anchor point for drawing a
+  // glyph into a w x h box, used identically for both the guide layer and
+  // the trace-accuracy mask so the two always line up exactly.
+  //
+  // Starts from a standard size (GUIDE_BASE_RATIO of the box width) and
+  // then checks the glyph's *actual measured ink* — not its advance-box —
+  // against a hard cap (GUIDE_MAX_INK_RATIO of the box). Some Telugu
+  // letters/conjuncts (e.g. ౠ, క్ష) render with ink noticeably larger than
+  // the base size assumes, which clipped against the canvas edge; shrinking
+  // per-letter to fit keeps every glyph fully inside the drawing box.
+  const GUIDE_BASE_RATIO = 0.68;
+  const GUIDE_MAX_INK_RATIO = 0.82;
+
+  function computeGlyphLayout(ctx, telugu, w, h) {
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+
+    let size = w * GUIDE_BASE_RATIO;
+    ctx.font = `900 ${size}px "Noto Sans Telugu", sans-serif`;
+    let m = ctx.measureText(telugu);
+
+    const hasInkBox =
+      typeof m.actualBoundingBoxLeft === "number" &&
+      typeof m.actualBoundingBoxRight === "number" &&
+      typeof m.actualBoundingBoxAscent === "number" &&
+      typeof m.actualBoundingBoxDescent === "number";
+
+    if (hasInkBox) {
+      const inkWidth = m.actualBoundingBoxLeft + m.actualBoundingBoxRight;
+      const inkHeight = m.actualBoundingBoxAscent + m.actualBoundingBoxDescent;
+      const maxW = w * GUIDE_MAX_INK_RATIO;
+      const maxH = h * GUIDE_MAX_INK_RATIO;
+      const scale = Math.min(1, maxW / inkWidth, maxH / inkHeight);
+      if (isFinite(scale) && scale > 0 && scale < 1) {
+        size *= scale;
+        ctx.font = `900 ${size}px "Noto Sans Telugu", sans-serif`;
+        m = ctx.measureText(telugu);
+      }
+    }
+
+    // `textAlign: "center"` centers the glyph's *advance* width, not its
+    // visual ink. For Telugu conjuncts/vowel-signs the two can differ a lot
+    // (this shows up worst on WebKit/Safari, e.g. iPad), so nudge the draw
+    // position using the actual measured ink box to truly center it.
+    let anchorX = w / 2;
+    let anchorY = h / 2 + h * 0.03;
+    if (
+      typeof m.actualBoundingBoxLeft === "number" &&
+      typeof m.actualBoundingBoxRight === "number" &&
+      typeof m.actualBoundingBoxAscent === "number" &&
+      typeof m.actualBoundingBoxDescent === "number"
+    ) {
+      anchorX += (m.actualBoundingBoxLeft - m.actualBoundingBoxRight) / 2;
+      anchorY += (m.actualBoundingBoxAscent - m.actualBoundingBoxDescent) / 2;
+    }
+
+    return { size, anchorX, anchorY };
+  }
+
   function paintGuide(letter, rect) {
     guideCtx.clearRect(0, 0, rect.width, rect.height);
 
-    const size = rect.width * 0.68;
-    guideCtx.font = `900 ${size}px "Noto Sans Telugu", sans-serif`;
-    guideCtx.textAlign = "center";
-    guideCtx.textBaseline = "middle";
     guideCtx.lineWidth = Math.max(3, rect.width * 0.012);
     guideCtx.setLineDash([rect.width * 0.018, rect.width * 0.02]);
     guideCtx.strokeStyle = "#C9C6DD";
-    guideCtx.strokeText(letter.telugu, rect.width / 2, rect.height / 2 + rect.height * 0.03);
 
-    // Faint starting-point dot to hint where little hands can begin.
-    guideCtx.setLineDash([]);
-    guideCtx.fillStyle = "#FFC93C";
-    guideCtx.beginPath();
-    guideCtx.arc(rect.width * 0.5 - size * 0.32, rect.height * 0.5 - size * 0.28, rect.width * 0.014, 0, Math.PI * 2);
-    guideCtx.fill();
+    const layout = computeGlyphLayout(guideCtx, letter.telugu, rect.width, rect.height);
+    guideCtx.font = `900 ${layout.size}px "Noto Sans Telugu", sans-serif`;
+    guideCtx.textAlign = "center";
+    guideCtx.textBaseline = "middle";
+    guideCtx.strokeText(letter.telugu, layout.anchorX, layout.anchorY);
   }
 
   // Full redraw for a *new* letter: fresh guide, and the drawing layer is
-  // deliberately cleared (a new letter always starts blank).
+  // deliberately cleared (a new letter always starts blank). In Practice
+  // mode the guide layer is deliberately left blank — no outline — so the
+  // child draws the letter purely from memory.
   function drawGuide(letter) {
     const rect = setupCanvasSize(false);
     drawCtx.clearRect(0, 0, rect.width, rect.height);
-    paintGuide(letter, rect);
+    hasInk = false;
+    scoreMaskCache = null;
+    if (practiceMode) {
+      guideCtx.clearRect(0, 0, rect.width, rect.height);
+    } else {
+      paintGuide(letter, rect);
+    }
   }
 
   // Called only on window resize: re-measures the canvas and, if its CSS
@@ -192,16 +500,18 @@
   // the child had already drawn instead of wiping it.
   function handleCanvasResize() {
     if (practiceScreen.classList.contains("hidden")) return;
-    const rect = canvasWrap.getBoundingClientRect();
+    const rect = guideCanvas.getBoundingClientRect();
     const changed = Math.round(rect.width) !== Math.round(lastCanvasSize.w) || Math.round(rect.height) !== Math.round(lastCanvasSize.h);
     if (!changed) return;
     const newRect = setupCanvasSize(true);
-    paintGuide(LETTERS[currentIndex], newRect);
+    scoreMaskCache = null;
+    if (!practiceMode) paintGuide(currentLetter(), newRect);
   }
 
   function clearDrawing() {
-    const rect = canvasWrap.getBoundingClientRect();
+    const rect = guideCanvas.getBoundingClientRect();
     drawCtx.clearRect(0, 0, rect.width, rect.height);
+    hasInk = false;
   }
 
   // ---------- Pointer drawing ----------
@@ -211,6 +521,7 @@
   }
   function pointerDown(evt) {
     drawing = true;
+    hasInk = true;
     drawCanvas.setPointerCapture(evt.pointerId);
     lastPoint = getPos(evt);
     drawCtx.strokeStyle = currentColor;
@@ -260,12 +571,41 @@
   }
 
   // ---------- Speech (Web Speech API) ----------
+  // Browsers expose a Telugu voice (if any) asynchronously — on first load
+  // getVoices() can return an empty list until 'voiceschanged' fires. We pick
+  // the best-available Telugu voice once and cache it, instead of leaving the
+  // browser to guess from a bare "te-IN" lang string (which on many
+  // platforms silently falls back to a default/English voice with wrong
+  // pronunciation).
+  let teluguVoice = null;
+  let voiceReady = false;
+
+  function pickTeluguVoice() {
+    if (!("speechSynthesis" in window)) return;
+    const voices = window.speechSynthesis.getVoices();
+    if (!voices || !voices.length) return;
+    voiceReady = true;
+    teluguVoice =
+      voices.find((v) => /^te(-|_|$)/i.test(v.lang)) ||
+      voices.find((v) => /telugu/i.test(v.name)) ||
+      null;
+  }
+  if ("speechSynthesis" in window) {
+    pickTeluguVoice();
+    window.speechSynthesis.addEventListener("voiceschanged", pickTeluguVoice);
+  }
+
   function speak(text, lang) {
     if (!("speechSynthesis" in window) || !text) return;
     try {
       window.speechSynthesis.cancel();
       const utter = new SpeechSynthesisUtterance(text);
-      utter.lang = lang || "te-IN";
+      if (teluguVoice) {
+        utter.voice = teluguVoice;
+        utter.lang = teluguVoice.lang;
+      } else {
+        utter.lang = lang || "te-IN";
+      }
       utter.rate = 0.8;
       utter.pitch = 1.05;
       window.speechSynthesis.speak(utter);
@@ -274,11 +614,225 @@
     }
   }
 
+  // ---------- Trace-accuracy scoring ----------
+  // The guide shows a dashed outline of the letter; a good trace fills in
+  // roughly that shape. We build THREE masks from the same glyph (same
+  // layout, so they're all perfectly aligned with each other and with the
+  // guide) and compare them, at coarse resolution, against what the child
+  // actually drew:
+  //   - a SOLID mask (the glyph's bold fill, no padding) — used only to find
+  //     the glyph's own ink bounding box for size/position normalization
+  //     (see NORMALIZE_* above); not used for scoring directly.
+  //   - a CORE mask (the same glyph, same size/position, but rendered at a
+  //     much thinner font weight) — coverage is measured against this, so
+  //     it answers "did the ink pass through the letter's real stroke path?"
+  //     rather than "did the ink fill this bold glyph's full thickness?",
+  //     which a real pen stroke can actually achieve.
+  //   - a DILATED mask (the bold solid fill plus a soft tolerance halo) —
+  //     precision is measured against this, so a reasonably-close-but-not-
+  //     exact trace (a kid's real hand) isn't punished for drifting a few
+  //     pixels off the exact outline, while ink that lands well outside the
+  //     letter's shape still counts against them.
+  // Using different masks for the two metrics (rather than one mask for
+  // both) means neither metric is diluted by pixels the other was never
+  // meant to require, so a genuinely accurate trace can score close to 100%.
+  let scoreMaskCache = null; // { letterId, coreData, dilatedData, maskBox }
+
+  // Scans an RGBA buffer for its ink bounding box (alpha > 40), in pixel
+  // coordinates. Returns null if there's no ink at all.
+  function inkBBox(data, w, h) {
+    let minX = w,
+      minY = h,
+      maxX = -1,
+      maxY = -1;
+    for (let y = 0; y < h; y++) {
+      const rowOffset = y * w;
+      for (let x = 0; x < w; x++) {
+        if (data[(rowOffset + x) * 4 + 3] > 40) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+    if (maxX < 0) return null;
+    return { minX, minY, maxX, maxY, w: maxX - minX + 1, h: maxY - minY + 1 };
+  }
+
+  function buildMasks(letter) {
+    const solid = document.createElement("canvas");
+    solid.width = SCORE_SIZE;
+    solid.height = SCORE_SIZE;
+    const sctx = solid.getContext("2d");
+    // Same layout function as the guide (base size + per-glyph shrink-to-fit
+    // + ink-centered anchor), at the mask's own resolution, so every mask
+    // always matches what the guide actually shows on screen. The layout
+    // (size + anchor) is computed once here, at the guide's own bold weight,
+    // and reused as-is for the core mask below — only the font *weight*
+    // changes, not the position or size, so the two stay concentric.
+    const layout = computeGlyphLayout(sctx, letter.telugu, SCORE_SIZE, SCORE_SIZE);
+    sctx.font = `900 ${layout.size}px "Noto Sans Telugu", sans-serif`;
+    sctx.fillStyle = "#000";
+    sctx.fillText(letter.telugu, layout.anchorX, layout.anchorY);
+
+    const core = document.createElement("canvas");
+    core.width = SCORE_SIZE;
+    core.height = SCORE_SIZE;
+    const cctx = core.getContext("2d");
+    cctx.textAlign = "center";
+    cctx.textBaseline = "middle";
+    cctx.font = `${CORE_WEIGHT} ${layout.size}px "Noto Sans Telugu", sans-serif`;
+    cctx.fillStyle = "#000";
+    cctx.fillText(letter.telugu, layout.anchorX, layout.anchorY);
+
+    const dilated = document.createElement("canvas");
+    dilated.width = SCORE_SIZE;
+    dilated.height = SCORE_SIZE;
+    const dctx = dilated.getContext("2d");
+    dctx.textAlign = "center";
+    dctx.textBaseline = "middle";
+    dctx.font = `900 ${layout.size}px "Noto Sans Telugu", sans-serif`;
+    dctx.fillStyle = "#000";
+    dctx.fillText(letter.telugu, layout.anchorX, layout.anchorY);
+    dctx.lineWidth = SCORE_SIZE * DILATE_RATIO;
+    dctx.strokeStyle = "#000";
+    dctx.strokeText(letter.telugu, layout.anchorX, layout.anchorY);
+
+    const solidData = sctx.getImageData(0, 0, SCORE_SIZE, SCORE_SIZE).data;
+    let coreData = cctx.getImageData(0, 0, SCORE_SIZE, SCORE_SIZE).data;
+    const dilatedData = dctx.getImageData(0, 0, SCORE_SIZE, SCORE_SIZE).data;
+    const maskBox = inkBBox(solidData, SCORE_SIZE, SCORE_SIZE);
+
+    // A handful of very thin marks (e.g. the anusvara dot ం) can all but
+    // vanish at the lighter core weight. If the core came out empty (or
+    // tiny) for a glyph that clearly does have ink at the bold weight, fall
+    // back to the bold fill itself as the core — better a slightly stricter
+    // target than a mask with (near-)nothing to hit.
+    let coreCount = 0;
+    for (let i = 3; i < coreData.length; i += 4) if (coreData[i] > 40) coreCount++;
+    if (coreCount < 8 && maskBox) {
+      coreData = solidData;
+    }
+
+    return { coreData, dilatedData, maskBox };
+  }
+
+  function getMasks(letter) {
+    if (!scoreMaskCache || scoreMaskCache.letterId !== letter.id) {
+      scoreMaskCache = { letterId: letter.id, ...buildMasks(letter) };
+    }
+    return scoreMaskCache;
+  }
+
+  function scoreDrawing(letter) {
+    const { coreData, dilatedData, maskBox } = getMasks(letter);
+
+    // Downsample the child's full-resolution drawing once.
+    const sample = document.createElement("canvas");
+    sample.width = SCORE_SIZE;
+    sample.height = SCORE_SIZE;
+    const sctx = sample.getContext("2d");
+    sctx.drawImage(drawCanvas, 0, 0, drawCanvas.width, drawCanvas.height, 0, 0, SCORE_SIZE, SCORE_SIZE);
+    const rawData = sctx.getImageData(0, 0, SCORE_SIZE, SCORE_SIZE).data;
+
+    let rawInkCount = 0;
+    for (let i = 3; i < rawData.length; i += 4) if (rawData[i] > 40) rawInkCount++;
+
+    if (rawInkCount < MIN_INK_PIXELS || !maskBox) {
+      return { coverage: 0, precision: 0, drawCount: rawInkCount, maskCount: 0 };
+    }
+
+    // Re-fit the child's ink onto the glyph's own ink bounding box (see the
+    // NORMALIZE_* comment above) before comparing shapes. Only ever scales
+    // UP, never down: a small/offset drawing gets magnified to a fair size
+    // before grading, but a scribble already as big as (or bigger than) the
+    // letter never gets shrunk to fit inside it — shrinking would let a
+    // scribble spanning the whole box cheat its way to a tight-looking
+    // match, exactly the "filled the whole box" trick the scorer must not
+    // reward.
+    let scoredData = rawData;
+    const srcBox = inkBBox(rawData, SCORE_SIZE, SCORE_SIZE);
+    if (srcBox) {
+      const minExtent = SCORE_SIZE * NORMALIZE_MIN_EXTENT_RATIO;
+      let scaleX = srcBox.w >= minExtent ? maskBox.w / srcBox.w : 1;
+      let scaleY = srcBox.h >= minExtent ? maskBox.h / srcBox.h : 1;
+      scaleX = Math.min(NORMALIZE_MAX_SCALE, Math.max(1, scaleX));
+      scaleY = Math.min(NORMALIZE_MAX_SCALE, Math.max(1, scaleY));
+
+      if (scaleX !== 1 || scaleY !== 1) {
+        const destW = srcBox.w * scaleX;
+        const destH = srcBox.h * scaleY;
+        const destX = maskBox.minX + (maskBox.w - destW) / 2;
+        const destY = maskBox.minY + (maskBox.h - destH) / 2;
+
+        const norm = document.createElement("canvas");
+        norm.width = SCORE_SIZE;
+        norm.height = SCORE_SIZE;
+        const nctx = norm.getContext("2d");
+        nctx.drawImage(sample, srcBox.minX, srcBox.minY, srcBox.w, srcBox.h, destX, destY, destW, destH);
+        scoredData = nctx.getImageData(0, 0, SCORE_SIZE, SCORE_SIZE).data;
+      }
+    }
+
+    let coreCount = 0,
+      scoredInkCount = 0,
+      insideCoreCount = 0,
+      insideDilatedCount = 0;
+    const n = SCORE_SIZE * SCORE_SIZE;
+    for (let i = 0; i < n; i++) {
+      const a = i * 4 + 3;
+      const coreInk = coreData[a] > 40;
+      const dilatedInk = dilatedData[a] > 40;
+      const drawInk = scoredData[a] > 40;
+      if (coreInk) coreCount++;
+      if (drawInk) {
+        scoredInkCount++;
+        if (coreInk) insideCoreCount++;
+        if (dilatedInk) insideDilatedCount++;
+      }
+    }
+
+    const coverage = coreCount ? insideCoreCount / coreCount : 0;
+    const precision = scoredInkCount ? insideDilatedCount / scoredInkCount : 0;
+    // drawCount reports the child's *actual* ink amount (not the resized
+    // copy used for shape comparison) — it's only ever used to gate "did
+    // they draw enough to grade at all", which must reflect the real attempt.
+    return { coverage, precision, drawCount: rawInkCount, maskCount: coreCount };
+  }
+
+  function gradeAttempt(letter) {
+    if (!hasInk) return { verdict: "empty" };
+    const result = scoreDrawing(letter);
+    if (result.drawCount < MIN_INK_PIXELS) return { verdict: "empty", result };
+    const passed = result.coverage >= COVERAGE_MIN && result.precision >= PRECISION_MIN && percentScore(result) >= PASS_MATCH_MIN;
+    return { verdict: passed ? "pass" : "retry", result };
+  }
+
+  // Turns a {coverage, precision} pair into a single 0-100 "match" percentage
+  // for Practice mode, by multiplying them rather than averaging. A product
+  // needs BOTH numbers to be genuinely good to score well — a plain average
+  // (or a harmonic mean/F1) lets one so-so metric coast on the other being
+  // high, which is exactly how a dense, spread-out scribble sneaks through:
+  // criss-crossing enough of the box tends to rack up *moderate* coverage
+  // and *moderate* precision at once (each around 0.5-0.7) purely by
+  // covering a lot of ground, and an average of two moderate numbers is
+  // still moderate. Multiplying punishes that combination hard (0.6 x 0.6 is
+  // only 0.36) while barely denting a real letter, where both numbers are
+  // already high (0.9 x 0.95 stays 0.85) — so it rewards a shape that's
+  // genuinely both complete *and* on-target, not just "covered a lot of the
+  // box somehow".
+  function percentScore(result) {
+    if (!result || result.drawCount < MIN_INK_PIXELS) return 0;
+    const { coverage, precision } = result;
+    return Math.round(coverage * precision * 100);
+  }
+
   // ---------- Practice screen render ----------
   function renderPracticeScreen() {
-    const letter = LETTERS[currentIndex];
-    progressPill.textContent = `${currentIndex + 1} / ${LETTERS.length}`;
-    groupPill.textContent = letter.group;
+    const letter = currentLetter();
+    progressPill.textContent = `${letterIndex + 1} / ${currentLesson.letters.length}`;
+    groupPill.textContent = currentLesson.title;
     bigLetterPreview.textContent = letter.telugu;
     translitLabel.textContent = letter.translit;
 
@@ -298,11 +852,12 @@
       noteRow.classList.add("hidden");
     }
 
-    btnPrev.disabled = currentIndex === 0;
-    btnNext.disabled = currentIndex === LETTERS.length - 1;
+    btnPrev.disabled = letterIndex === 0;
+    btnNext.disabled = letterIndex === currentLesson.letters.length - 1;
     btnPrev.style.opacity = btnPrev.disabled ? 0.35 : 1;
     btnNext.style.opacity = btnNext.disabled ? 0.35 : 1;
 
+    updatePracticeBadge();
     drawGuide(letter);
   }
 
@@ -311,47 +866,231 @@
     practiceScreen.classList.remove("hidden");
     window.scrollTo(0, 0);
     buildColorRow();
+    // Entering a lesson fresh from the Lessons list always starts in Trace
+    // (guided) mode; Practice mode is something a child opts into per session.
+    setPracticeMode(false);
     // Layout needs a frame to settle before we measure canvas size.
     requestAnimationFrame(renderPracticeScreen);
   }
 
+  // ---------- Letter picker: jump to another character in this lesson ----------
+  // Reachable from the practice screen (tapping the progress or lesson-name
+  // pill) so a child can hop between the characters they're currently
+  // working on without leaving the lesson or going all the way back Home.
+  function buildLessonPickerGrid() {
+    lessonPickerGrid.innerHTML = "";
+    currentLesson.letters.forEach((letter, idx) => {
+      const tile = document.createElement("button");
+      tile.type = "button";
+      tile.className = "picker-tile tel" + (progress[letter.id] ? " practiced" : "") + (idx === letterIndex ? " current" : "");
+      tile.setAttribute("aria-label", `${letter.translit}${idx === letterIndex ? " (current letter)" : ""}${progress[letter.id] ? " (already practiced)" : ""}`);
+      tile.textContent = letter.telugu;
+      if (progress[letter.id]) {
+        tile.insertAdjacentHTML(
+          "beforeend",
+          '<svg class="picker-check" viewBox="0 0 24 24"><circle cx="12" cy="12" r="11" fill="#43B26D" stroke="#fff" stroke-width="2"/><path d="M7.5 12.5l3 3 6-6.5" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+        );
+      }
+      tile.addEventListener("click", () => {
+        closeLessonPicker();
+        goTo(idx);
+      });
+      lessonPickerGrid.appendChild(tile);
+    });
+  }
+
+  function openLessonPicker() {
+    lessonPickerTitle.textContent = `${currentLesson.title} — ${currentLesson.subtitle}`;
+    lessonPickerSubtitle.textContent = "Tap a letter to jump to it";
+    buildLessonPickerGrid();
+    lessonPickerOverlay.classList.remove("hidden");
+  }
+  function closeLessonPicker() {
+    lessonPickerOverlay.classList.add("hidden");
+  }
+
   function goTo(index) {
-    if (index < 0 || index >= LETTERS.length) return;
-    currentIndex = index;
+    if (index < 0 || index >= currentLesson.letters.length) return;
+    letterIndex = index;
     if (window.speechSynthesis) window.speechSynthesis.cancel();
+    // Moving to a different letter (Prev/Next/arrow keys) always lands back
+    // in Trace mode — Practice mode is the deliberate follow-up step right
+    // after tracing *this* letter, not a mode that carries over between
+    // letters (the next letter hasn't been traced yet).
+    practiceMode = false;
+    applyModeClasses();
     renderPracticeScreen();
   }
 
-  // ---------- Celebration ----------
-  function celebrate() {
-    const letter = LETTERS[currentIndex];
-    markPracticed(letter.id);
-    celebrateOverlay.classList.remove("hidden");
+  // ---------- Trace / Practice mode toggle ----------
+  function applyModeClasses() {
+    modeTraceBtn.classList.toggle("active", !practiceMode);
+    modePracticeBtn.classList.toggle("active", practiceMode);
+    canvasWrap.classList.toggle("practice-mode", practiceMode);
+  }
+
+  function updatePracticeBadge() {
+    if (!practiceMode) {
+      practiceBestBadge.classList.add("hidden");
+      return;
+    }
+    const best = practiceBest[currentLetter().id];
+    if (typeof best === "number") {
+      practiceBestBadge.textContent = `Best: ${best}%`;
+      practiceBestBadge.classList.remove("hidden");
+    } else {
+      practiceBestBadge.classList.add("hidden");
+    }
+  }
+
+  function setPracticeMode(on) {
+    practiceMode = on;
+    applyModeClasses();
+    updatePracticeBadge();
+    btnDoneLabel.textContent = on ? "See my score!" : "Check it!";
+    // Re-render the guide layer for the new mode (blank vs. dashed outline)
+    // and clear whatever was drawn, since switching modes mid-attempt
+    // wouldn't make sense to score against either guide.
+    if (!practiceScreen.classList.contains("hidden")) {
+      drawGuide(currentLetter());
+    }
+  }
+
+  // ---------- Celebration / retry ----------
+  function pick(arr) {
+    return arr[Math.floor(Math.random() * arr.length)];
+  }
+
+  function showOverlay(stateClass, text, durationMs, onDone) {
+    celebrateOverlay.className = "celebrate-overlay " + stateClass;
+    celebrateText.textContent = text;
     setTimeout(() => {
       celebrateOverlay.classList.add("hidden");
+      if (onDone) onDone();
+    }, durationMs);
+  }
+
+  function handleDone() {
+    if (busyGrading) return;
+    const letter = currentLetter();
+    const grade = gradeAttempt(letter);
+
+    if (grade.verdict === "empty") {
+      busyGrading = true;
+      showOverlay("state-retry", pick(EMPTY_MESSAGES), 1200, () => {
+        busyGrading = false;
+      });
+      return;
+    }
+
+    if (grade.verdict === "retry") {
+      busyGrading = true;
+      showOverlay("state-retry", pick(RETRY_MESSAGES), 1500, () => {
+        clearDrawing();
+        busyGrading = false;
+      });
+      return;
+    }
+
+    // Passed!
+    markPracticed(letter.id);
+    const isLastInLesson = letterIndex === currentLesson.letters.length - 1;
+    const lessonNowComplete = isLastInLesson && lessonPracticedCount(currentLesson) === currentLesson.letters.length;
+
+    busyGrading = true;
+    if (lessonNowComplete) {
+      showOverlay("state-lesson", `Lesson complete! 🎉 Great work on all ${currentLesson.letters.length} letters!`, 2000, () => {
+        busyGrading = false;
+        showHomeScreen();
+      });
+    } else {
+      // A good trace is followed by Practice on the *same* letter — drawing
+      // it once from memory right away is much more useful for actually
+      // learning the shape than immediately moving on to the next letter.
+      showOverlay("state-success", `${pick(SUCCESS_MESSAGES)} Now try it from memory!`, 1500, () => {
+        busyGrading = false;
+        setPracticeMode(true);
+      });
+    }
+  }
+
+  // Practice mode's "I'm done": grades against the same accuracy scorer as
+  // Trace mode, but always reports a percentage instead of a binary pass/
+  // retry, and never auto-advances — the point is repeated attempts at the
+  // *same* letter until the score (and the child's memory of the shape)
+  // improves. Doesn't touch the Trace-mode "practiced" star/progress at all;
+  // it has its own separate best-score record instead.
+  function handlePracticeDone() {
+    if (busyGrading) return;
+    const letter = currentLetter();
+
+    if (!hasInk) {
+      busyGrading = true;
+      showOverlay("state-retry", pick(PRACTICE_EMPTY_MESSAGES), 1300, () => {
+        busyGrading = false;
+      });
+      return;
+    }
+
+    const result = scoreDrawing(letter);
+    if (result.drawCount < MIN_INK_PIXELS) {
+      busyGrading = true;
+      showOverlay("state-retry", pick(PRACTICE_EMPTY_MESSAGES), 1300, () => {
+        busyGrading = false;
+      });
+      return;
+    }
+
+    const pct = percentScore(result);
+    recordPracticeScore(letter.id, pct);
+    updatePracticeBadge();
+
+    let stateClass, text;
+    if (pct >= PRACTICE_GREAT_MIN) {
+      stateClass = "state-success";
+      text = `🎯 ${pct}% match! ${pick(SUCCESS_MESSAGES)}`;
+    } else if (pct >= PRACTICE_OK_MIN) {
+      stateClass = "state-retry";
+      text = `🎯 ${pct}% match — good try! Draw it again to improve.`;
+    } else {
+      stateClass = "state-retry";
+      text = `🎯 ${pct}% match — let's try that again!`;
+    }
+
+    busyGrading = true;
+    showOverlay(stateClass, text, 1800, () => {
       clearDrawing();
-      if (currentIndex < LETTERS.length - 1) {
-        goTo(currentIndex + 1);
-      }
-    }, 1300);
+      busyGrading = false;
+    });
   }
 
   // ---------- Wire up controls ----------
   btnHome.addEventListener("click", showHomeScreen);
-  btnPrev.addEventListener("click", () => goTo(currentIndex - 1));
-  btnNext.addEventListener("click", () => goTo(currentIndex + 1));
+  btnPrev.addEventListener("click", () => goTo(letterIndex - 1));
+  btnNext.addEventListener("click", () => goTo(letterIndex + 1));
   btnClear.addEventListener("click", clearDrawing);
-  btnDone.addEventListener("click", celebrate);
-  btnSayLetter.addEventListener("click", () => speak(LETTERS[currentIndex].telugu, "te-IN"));
+  btnDone.addEventListener("click", () => (practiceMode ? handlePracticeDone() : handleDone()));
+  modeTraceBtn.addEventListener("click", () => setPracticeMode(false));
+  modePracticeBtn.addEventListener("click", () => setPracticeMode(true));
+  btnSayLetter.addEventListener("click", () => speak(currentLetter().telugu, "te-IN"));
   btnSayWord.addEventListener("click", () => {
-    const l = LETTERS[currentIndex];
+    const l = currentLetter();
     if (l.word) speak(l.word, "te-IN");
   });
+  progressPill.addEventListener("click", openLessonPicker);
+  groupPill.addEventListener("click", openLessonPicker);
+  lessonPickerClose.addEventListener("click", closeLessonPicker);
+  lessonPickerBackdrop.addEventListener("click", closeLessonPicker);
 
   window.addEventListener("keydown", (e) => {
     if (practiceScreen.classList.contains("hidden")) return;
-    if (e.key === "ArrowRight") goTo(currentIndex + 1);
-    if (e.key === "ArrowLeft") goTo(currentIndex - 1);
+    if (e.key === "Escape" && !lessonPickerOverlay.classList.contains("hidden")) {
+      closeLessonPicker();
+      return;
+    }
+    if (!lessonPickerOverlay.classList.contains("hidden")) return;
+    if (e.key === "ArrowRight") goTo(letterIndex + 1);
+    if (e.key === "ArrowLeft") goTo(letterIndex - 1);
   });
 
   window.addEventListener("resize", handleCanvasResize);
@@ -364,6 +1103,178 @@
       });
     });
   }
+
+  // If the practice screen is opened before the Noto Sans Telugu web font has
+  // finished downloading, the guide glyph briefly draws with a fallback
+  // font's (wrong) metrics. Canvas text doesn't auto-repaint when a web font
+  // swaps in, so redraw once the browser reports fonts are ready.
+  if (document.fonts && document.fonts.ready && document.fonts.ready.then) {
+    document.fonts.ready.then(() => {
+      if (!practiceScreen.classList.contains("hidden")) {
+        // Repaint just the guide layer — never touch what the child has
+        // already drawn. Practice mode's guide is deliberately blank, so
+        // there's nothing to repaint there.
+        scoreMaskCache = null;
+        if (!practiceMode) paintGuide(currentLetter(), guideCanvas.getBoundingClientRect());
+      }
+    });
+  }
+
+  // ---------- Test hooks (harmless in production; used by the Playwright
+  // suite to simulate drawings and inspect scoring without needing real
+  // pointer gestures) ----------
+  window.__vidyarthiTest = {
+    getCurrentLetter: () => currentLetter(),
+    getDrawCtx: () => drawCtx,
+    getGuideRect: () => guideCanvas.getBoundingClientRect(),
+    markHasInk: () => {
+      hasInk = true;
+    },
+    scoreDrawing: () => scoreDrawing(currentLetter()),
+    gradeAttempt: () => gradeAttempt(currentLetter()),
+    isPracticeMode: () => practiceMode,
+    getPracticeBest: () => ({ ...practiceBest }),
+    getGuideInkCount: () => {
+      const c = guideCanvas;
+      const ctx = c.getContext("2d");
+      const data = ctx.getImageData(0, 0, c.width, c.height).data;
+      let n = 0;
+      for (let i = 3; i < data.length; i += 4) if (data[i] > 40) n++;
+      return n;
+    },
+    // Paints a pixel-accurate fill of the current letter onto the draw
+    // layer using the exact same layout (size + anchor) the scoring mask
+    // itself uses, for testing the scorer's achievable ceiling in isolation
+    // from any hand-drawn imprecision.
+    paintPerfectFillForTest: () => {
+      const letter = currentLetter();
+      const rect = guideCanvas.getBoundingClientRect();
+      const layout = computeGlyphLayout(drawCtx, letter.telugu, rect.width, rect.height);
+      drawCtx.font = `900 ${layout.size}px "Noto Sans Telugu", sans-serif`;
+      drawCtx.textAlign = "center";
+      drawCtx.textBaseline = "middle";
+      drawCtx.fillStyle = "#000";
+      drawCtx.fillText(letter.telugu, layout.anchorX, layout.anchorY);
+      hasInk = true;
+    },
+    // Paints a fill of the current letter at a given font *weight* (same
+    // layout/position as every other test/scoring fill — only the weight
+    // differs), optionally with a small random offset — for testing a
+    // genuinely good but imperfect real fill (thinner-stroked and slightly
+    // off-true than the bold printed guide) against the CORE-mask scoring
+    // recalibration, without the test's own font-size math drifting out of
+    // sync with computeGlyphLayout's ink-based auto-shrink (which the real
+    // scoring masks always use).
+    paintWeightedFillForTest: (weight, jitterFrac) => {
+      const letter = currentLetter();
+      const rect = guideCanvas.getBoundingClientRect();
+      const layout = computeGlyphLayout(drawCtx, letter.telugu, rect.width, rect.height);
+      const jitter = (jitterFrac || 0) * rect.width;
+      const jx = (Math.random() * 2 - 1) * jitter;
+      const jy = (Math.random() * 2 - 1) * jitter;
+      drawCtx.font = `${weight || 900} ${layout.size}px "Noto Sans Telugu", sans-serif`;
+      drawCtx.textAlign = "center";
+      drawCtx.textBaseline = "middle";
+      drawCtx.fillStyle = "#000";
+      drawCtx.fillText(letter.telugu, layout.anchorX + jx, layout.anchorY + jy);
+      hasInk = true;
+    },
+    // Paints a copy of the current letter shrunk by `scale` and shifted by
+    // (offsetXFrac, offsetYFrac) of the box size from its normal centered
+    // spot — for testing that a smaller/off-center but otherwise-correct
+    // freehand copy still scores well after bounding-box normalization.
+    paintScaledFillForTest: (scale, offsetXFrac, offsetYFrac) => {
+      const letter = currentLetter();
+      const rect = guideCanvas.getBoundingClientRect();
+      const layout = computeGlyphLayout(drawCtx, letter.telugu, rect.width, rect.height);
+      const size = layout.size * scale;
+      drawCtx.font = `900 ${size}px "Noto Sans Telugu", sans-serif`;
+      drawCtx.textAlign = "center";
+      drawCtx.textBaseline = "middle";
+      drawCtx.fillStyle = "#000";
+      const ax = layout.anchorX + rect.width * (offsetXFrac || 0);
+      const ay = layout.anchorY + rect.height * (offsetYFrac || 0);
+      drawCtx.fillText(letter.telugu, ax, ay);
+      hasInk = true;
+    },
+    // Paints a non-uniformly stretched copy of the current letter (different
+    // scale per axis, optionally offset) — for testing letters drawn a bit
+    // taller/shorter or narrower/wider than the printed glyph, not just
+    // smaller.
+    paintDistortedFillForTest: (scaleX, scaleY, offsetXFrac, offsetYFrac) => {
+      const letter = currentLetter();
+      const rect = guideCanvas.getBoundingClientRect();
+      const layout = computeGlyphLayout(drawCtx, letter.telugu, rect.width, rect.height);
+      const cx = layout.anchorX + rect.width * (offsetXFrac || 0);
+      const cy = layout.anchorY + rect.height * (offsetYFrac || 0);
+      drawCtx.save();
+      drawCtx.translate(cx, cy);
+      drawCtx.scale(scaleX, scaleY);
+      drawCtx.translate(-layout.anchorX, -layout.anchorY);
+      drawCtx.font = `900 ${layout.size}px "Noto Sans Telugu", sans-serif`;
+      drawCtx.textAlign = "center";
+      drawCtx.textBaseline = "middle";
+      drawCtx.fillStyle = "#000";
+      drawCtx.fillText(letter.telugu, layout.anchorX, layout.anchorY);
+      drawCtx.restore();
+      hasInk = true;
+    },
+    // Simulates a *realistic hand-drawn* attempt, as opposed to the
+    // pixel-perfect fills above: strokes (does not fill) the actual bold
+    // glyph's outline with a pen of the app's own real default width,
+    // optionally wobbled with small per-segment jitter — this is what a
+    // careful child's trace over the dashed guide actually looks like
+    // (ink that follows the letter's path at realistic thickness, not a
+    // solid-filled copy of the bold glyph), and is the scenario the
+    // coverage-scoring recalibration (CORE_WEIGHT) targets. `jitterFrac`
+    // is expressed as a fraction of the box width.
+    paintRealisticStrokeForTest: (jitterFrac) => {
+      const letter = currentLetter();
+      const rect = guideCanvas.getBoundingClientRect();
+      const layout = computeGlyphLayout(drawCtx, letter.telugu, rect.width, rect.height);
+      const jitter = (jitterFrac || 0) * rect.width;
+      drawCtx.save();
+      if (jitter > 0) {
+        // Canvas has no per-point jitter for strokeText, so approximate a
+        // wobbly hand by stroking several slightly-offset copies at a
+        // thinner width rather than one perfectly steady thick line —
+        // closer to how a real pen wanders around the intended path.
+        const steps = 5;
+        drawCtx.lineWidth = Math.max(6, rect.width * 0.022);
+        drawCtx.strokeStyle = "#000";
+        drawCtx.textAlign = "center";
+        drawCtx.textBaseline = "middle";
+        for (let i = 0; i < steps; i++) {
+          const dx = (Math.random() * 2 - 1) * jitter;
+          const dy = (Math.random() * 2 - 1) * jitter;
+          drawCtx.font = `900 ${layout.size}px "Noto Sans Telugu", sans-serif`;
+          drawCtx.strokeText(letter.telugu, layout.anchorX + dx, layout.anchorY + dy);
+        }
+      } else {
+        drawCtx.lineWidth = Math.max(10, rect.width * 0.045);
+        drawCtx.strokeStyle = "#000";
+        drawCtx.textAlign = "center";
+        drawCtx.textBaseline = "middle";
+        drawCtx.font = `900 ${layout.size}px "Noto Sans Telugu", sans-serif`;
+        drawCtx.strokeText(letter.telugu, layout.anchorX, layout.anchorY);
+      }
+      drawCtx.restore();
+      hasInk = true;
+    },
+    // Jumps straight to a given lesson/letter without clicking through the
+    // UI, for automated sweeps over every letter (e.g. glyph-fit checks).
+    gotoLetterForTest: (lesson, letter) => {
+      if (homeScreen.classList.contains("hidden") === false) {
+        currentLesson = lesson;
+        letterIndex = lesson.letters.findIndex((l) => l.id === letter.id);
+        showPracticeScreen();
+      } else {
+        currentLesson = lesson;
+        letterIndex = lesson.letters.findIndex((l) => l.id === letter.id);
+        renderPracticeScreen();
+      }
+    },
+  };
 
   // ---------- Init ----------
   showHomeScreen();

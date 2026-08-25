@@ -1,6 +1,6 @@
 // sw.js — minimal offline app-shell cache for Vidyarthi.
 // Bump CACHE_NAME whenever app files change to invalidate old caches.
-const CACHE_NAME = "vidyarthi-v2";
+const CACHE_NAME = "vidyarthi-v3";
 const APP_SHELL = [
   "./",
   "./index.html",
