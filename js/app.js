@@ -534,11 +534,36 @@
   // real ink extent — a canvas cannot lie about what it actually rendered,
   // so this is correct on every browser by construction, not by testing
   // against whichever ones happen to be available to check.
-  const GUIDE_BASE_RATIO = 0.68;
-  const GUIDE_MAX_INK_RATIO = 0.82;
+  // Lowered further after a follow-up report that ఊ/ౠ (and, by the same
+  // mechanism, other wide/tall-tailed glyphs) still clipped on the right
+  // on real iPad/iPhone even after the dpr fix. Two real, compounding
+  // causes were found and fixed alongside this: (1) the guide is drawn
+  // with strokeText() at a real stroke width, but layout was only ever
+  // measured against fillText()'s solid ink — a stroked outline extends
+  // roughly half the line width beyond the filled glyph's edge on every
+  // side, an overshoot the fit check never accounted for (see
+  // paintGuide's strokeMargin below); (2) the fit/containment check used
+  // the same INK_ALPHA_THRESHOLD as scoring, which can miss a faint,
+  // anti-aliased tail that's still visually present, especially if a
+  // browser's text shaper/hinting renders that edge a little differently
+  // than the one used to test this. Neither was fully reproducible in
+  // this environment (Chromium, no real Safari available to test
+  // against), so on top of fixing both directly, GUIDE_MAX_INK_RATIO
+  // itself is cut well below its old value — trading a visibly smaller
+  // guide for real headroom against whatever the remaining, unverifiable
+  // engine-specific difference turns out to be.
+  const GUIDE_BASE_RATIO = 0.6;
+  const GUIDE_MAX_INK_RATIO = 0.7;
   const INK_ALPHA_THRESHOLD = 40;
+  // Used only for the layout fit/containment check (never for scoring) —
+  // much more sensitive than INK_ALPHA_THRESHOLD so a faint, barely-
+  // anti-aliased tail still counts as "ink that must stay inside the box",
+  // rather than one browser's rendering of that same edge being fainter
+  // than another's and slipping under a coarser threshold.
+  const FIT_ALPHA_THRESHOLD = 2;
 
-  function computeGlyphLayout(telugu, w, h) {
+  function computeGlyphLayout(telugu, w, h, strokeMargin) {
+    strokeMargin = strokeMargin || 0;
     // Probing must happen on a plain, never-transformed canvas whose pixel
     // grid is exactly w x h. getImageData() always reads back *physical*
     // canvas pixels and completely ignores ctx.setTransform() — so probing
@@ -571,13 +596,20 @@
       ctx.font = `900 ${size}px "Noto Sans Telugu", sans-serif`;
       ctx.fillStyle = "#000";
       ctx.fillText(telugu, ax, ay);
-      const box = inkBBox(ctx.getImageData(0, 0, pw, ph).data, pw, ph);
+      // FIT_ALPHA_THRESHOLD, not INK_ALPHA_THRESHOLD: this is a safety
+      // check for what's visually on screen, so it needs to catch a faint
+      // anti-aliased tail too, not just solidly-inked pixels.
+      const box = inkBBox(ctx.getImageData(0, 0, pw, ph).data, pw, ph, FIT_ALPHA_THRESHOLD);
       ctx.clearRect(0, 0, pw, ph);
       return box;
     }
 
-    const maxW = w * GUIDE_MAX_INK_RATIO;
-    const maxH = h * GUIDE_MAX_INK_RATIO;
+    // strokeMargin (see paintGuide) shrinks the safe budget and the final
+    // containment check alike — the guide's dashed outline is stroked, not
+    // filled, so its actually-rendered footprint extends roughly half a
+    // line width beyond the filled ink this function measures.
+    const maxW = w * GUIDE_MAX_INK_RATIO - strokeMargin * 2;
+    const maxH = h * GUIDE_MAX_INK_RATIO - strokeMargin * 2;
 
     let size = w * GUIDE_BASE_RATIO;
     let anchorX = w / 2;
@@ -604,9 +636,16 @@
       }
 
       // Re-probe once more at the corrected anchor (centering shifts where
-      // the ink actually lands) and confirm it's genuinely inside the box.
+      // the ink actually lands) and confirm it's genuinely inside the box,
+      // with strokeMargin left clear on every side too.
       const check = probeInk(size, anchorX, anchorY);
-      if (check && check.minX >= 0 && check.maxX < w && check.minY >= 0 && check.maxY < h) {
+      if (
+        check &&
+        check.minX >= strokeMargin &&
+        check.maxX < w - strokeMargin &&
+        check.minY >= strokeMargin &&
+        check.maxY < h - strokeMargin
+      ) {
         return { size, anchorX, anchorY };
       }
       size *= 0.97; // still clipping somehow (rounding/hinting) — nudge down and retry
@@ -618,11 +657,18 @@
   function paintGuide(letter, rect) {
     guideCtx.clearRect(0, 0, rect.width, rect.height);
 
-    guideCtx.lineWidth = Math.max(3, rect.width * 0.012);
+    const strokeWidth = Math.max(3, rect.width * 0.012);
+    guideCtx.lineWidth = strokeWidth;
     guideCtx.setLineDash([rect.width * 0.018, rect.width * 0.02]);
     guideCtx.strokeStyle = "#C9C6DD";
 
-    const layout = computeGlyphLayout(letter.telugu, rect.width, rect.height);
+    // The guide is drawn with strokeText (an outline), which paints roughly
+    // strokeWidth/2 beyond the glyph's filled-ink edge on every side —
+    // computeGlyphLayout only ever measures fillText's solid ink, so it
+    // needs that half-width told to it explicitly or its "fits inside the
+    // box" check is checking the wrong shape (see the GUIDE_MAX_INK_RATIO
+    // comment above).
+    const layout = computeGlyphLayout(letter.telugu, rect.width, rect.height, strokeWidth / 2);
     guideCtx.font = `900 ${layout.size}px "Noto Sans Telugu", sans-serif`;
     guideCtx.textAlign = "center";
     guideCtx.textBaseline = "middle";
@@ -789,9 +835,13 @@
   // meant to require, so a genuinely accurate trace can score close to 100%.
   let scoreMaskCache = null; // { letterId, coreData, dilatedData, maskBox }
 
-  // Scans an RGBA buffer for its ink bounding box (alpha > INK_ALPHA_THRESHOLD), in pixel
-  // coordinates. Returns null if there's no ink at all.
-  function inkBBox(data, w, h) {
+  // Scans an RGBA buffer for its ink bounding box (alpha > threshold, which
+  // defaults to INK_ALPHA_THRESHOLD but can be overridden — see
+  // FIT_ALPHA_THRESHOLD's use in computeGlyphLayout for why a caller might
+  // want a more sensitive one), in pixel coordinates. Returns null if
+  // there's no ink at all.
+  function inkBBox(data, w, h, threshold) {
+    if (threshold === undefined) threshold = INK_ALPHA_THRESHOLD;
     let minX = w,
       minY = h,
       maxX = -1,
@@ -799,7 +849,7 @@
     for (let y = 0; y < h; y++) {
       const rowOffset = y * w;
       for (let x = 0; x < w; x++) {
-        if (data[(rowOffset + x) * 4 + 3] > INK_ALPHA_THRESHOLD) {
+        if (data[(rowOffset + x) * 4 + 3] > threshold) {
           if (x < minX) minX = x;
           if (x > maxX) maxX = x;
           if (y < minY) minY = y;
@@ -1322,6 +1372,11 @@
       hasInk = true;
     },
     scoreDrawing: () => scoreDrawing(currentLetter()),
+    // Exposes computeGlyphLayout's raw output at an arbitrary w x h for the
+    // current letter, so a test can compare the proportions it converges to
+    // at different absolute resolutions (e.g. the live guide canvas's CSS
+    // size vs SCORE_SIZE) — not used by the app itself.
+    debugLayoutForTest: (w, h) => computeGlyphLayout(currentLetter().telugu, w, h),
     // Exposes the bounding-box-normalization intermediates from inside
     // scoreDrawing() (srcBox/maskBox/scaleX/scaleY) for diagnosing scoring
     // weaknesses tied to NORMALIZE_MIN_EXTENT_RATIO on extreme-aspect-ratio

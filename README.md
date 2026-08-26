@@ -265,6 +265,29 @@ Six Playwright suites drive the app in a real headless browser:
   separately, by a since-fixed bounding-box-normalization gap for
   extreme-aspect-ratio glyphs (see `NORMALIZE_MIN_EXTENT_MASK_RATIO` in
   `js/app.js`).
+
+  A *third* follow-up report (ఊ, ౠ still clipping on the right on real
+  hardware even after the dpr fix) turned up two more real, compounding
+  bugs, neither reproducible from this dev environment (no real Safari
+  available to test against): the guide is drawn with `strokeText()` (an
+  outline), which paints roughly half its stroke width beyond the glyph's
+  *filled* ink on every side, but layout was only ever measured against
+  `fillText()`'s solid ink — an overshoot the fit check never accounted
+  for; and the fit/containment check used the same coarse alpha threshold
+  as scoring, which can miss a faint anti-aliased tail that's still
+  visually present, especially if one browser's text shaper renders that
+  edge a little differently than the one this was tested against. Both are
+  now fixed directly (`computeGlyphLayout` takes an explicit stroke-margin
+  parameter, and the fit check uses its own much more sensitive alpha
+  threshold — see `FIT_ALPHA_THRESHOLD` in `js/app.js`), *and*
+  `GUIDE_MAX_INK_RATIO`/`GUIDE_BASE_RATIO` were both cut well below their
+  prior values for real headroom against whatever, if anything, remains
+  unverifiable from here — margins roughly doubled across the full
+  592-letter sweep (worst case went from 14px to 27px on the tightest
+  viewport). The trade-off is a visibly smaller guide glyph than earlier
+  versions of this app; if a real device still clips after this, that
+  points to something more fundamental about that device's font rendering
+  than these margins can absorb, and is worth reporting with a screenshot.
 - `tests/test_shape_recognition.py` — the shape/pattern-recognition scoring
   dimension: a reported gap where a scribble that just fills the space
   where a letter's guide appears could score a high match, because

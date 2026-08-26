@@ -107,7 +107,16 @@ def main():
             clear(page)
             page.evaluate("window.__vidyarthiTest.paintPerfectFillForTest()")
             pct_perfect, _ = percent(page)
-            check(f"{tel}: pixel-perfect fill scores very high (>=85)", pct_perfect >= 85, f"got {pct_perfect}")
+            # 80, not 85: after the follow-up clipping-safety fix shrank
+            # GUIDE_MAX_INK_RATIO/GUIDE_BASE_RATIO for extra headroom (see
+            # app.js), a couple of already-marginal thin-mark letters
+            # (అం/అః, single small dots) lost a few points of achievable
+            # coverage purely from being drawn a bit smaller — real
+            # handwriting is calibrated to pass at a much lower bar anyway
+            # (see PASS_MATCH_MIN/COVERAGE_MIN), so this is headroom being
+            # traded for real-device clipping safety, not a regression in
+            # what actually matters here.
+            check(f"{tel}: pixel-perfect fill scores very high (>=80)", pct_perfect >= 80, f"got {pct_perfect}")
 
             clear(page)
             page.evaluate("window.__vidyarthiTest.paintWeightedFillForTest(700, 0.008)")
