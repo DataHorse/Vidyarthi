@@ -55,6 +55,22 @@ was built from.
   clearing its own bar on its own — the same guard that keeps a
   box-spanning scribble from scoring well in Practice mode below), and the
   drawing is never advanced or marked practiced on a failed attempt.
+- **Genuine shape/pattern recognition, not just area overlap**: coverage and
+  precision alone only ask "did ink land on the letter's shape" — a scribble
+  that densely fills most of the drawing box can satisfy that almost by
+  accident, without looking anything like the letter. A third check, shape,
+  closes that gap: the drawing is divided into an 8x8 grid of zones, and the
+  app builds an ink-density signature per zone for both the child's drawing
+  and the letter's own stroke path, then measures how well the two
+  *patterns* correlate (a classical OCR technique called "zoning") — dense
+  where the letter has strokes, sparse in its gaps, the way a person
+  actually recognizes a letter by eye rather than just checking "is there
+  ink roughly here". A scribble that fills the box evenly has almost no
+  pattern to correlate against anything and reads as "not this letter" even
+  where it happens to overlap it well; a real trace's pattern — even an
+  imprecise one — resembles the letter's own, because it approximately is.
+  Shape must independently clear its own threshold to pass, alongside
+  coverage and precision.
 - **Practice mode — a blank-box playground**: next to Trace mode (the
   dashed-outline guide), a "🎯 Practice" toggle switches to a completely
   blank box with no outline at all, so a child can test whether they've
@@ -75,10 +91,15 @@ was built from.
   so before grading, the app re-fits the child's own ink onto the glyph's
   own size (independently for width and height, magnifying only, and
   capped) so a small, off-center, or slightly-squished-but-correct letter
-  still scores well. The match percentage itself is coverage × precision
-  (not an average), which needs the drawing to be both essentially complete
-  *and* on-target to score well — a scribble that just covers a lot of the
-  box can't rack up a good score by being "kind of everywhere".
+  still scores well — including letters that are themselves naturally short
+  or narrow (like ౠ's vowel sign), where the "is this too thin to be a real
+  stroke" guard now scales down to match the letter's own proportions
+  instead of using one fixed pixel floor for every letter. The match
+  percentage itself is coverage × precision × a shape factor (not a plain
+  average), which needs the drawing to be complete, on-target, *and*
+  actually patterned like the letter to score well — a scribble that just
+  covers a lot of the box can't rack up a good score by being "kind of
+  everywhere".
 - **Jump to another letter without losing your place**: the progress pill
   (`3 / 15`) and lesson-name pill on the practice screen both open a letter
   picker for the *current* lesson — every letter as a tappable tile (with a
@@ -216,6 +237,33 @@ Six Playwright suites drive the app in a real headless browser:
 - `tests/test_glyph_fit.py` — sweeps all 592 letters at 4 viewport sizes and
   asserts every glyph's rendered ink stays inside the canvas edge (guards
   the ౠ/క్ష/గుణింతం-conjunct-style clipping fix).
+- `tests/test_centering.py` — the real, browser-independent fix for a
+  reported bug: on iPad, some letters rendered off-center (usually shifted
+  right) with part of the glyph clipped, because glyph layout trusted
+  `ctx.measureText()`'s `actualBoundingBox*` metrics, which turned out to
+  be unreliable for Telugu conjuncts/vowel-sign combinations on WebKit.
+  Layout now reads back *actual rendered pixels* (a pixel-probe, not a
+  metrics guess) to size and center every glyph, so it no longer depends on
+  any browser's text-metrics accuracy at all. Sweeps all 592 letters at two
+  viewports with a tight 6% centering tolerance (worst observed drift:
+  <0.6%), then proves the practical consequence — a letter drawn smaller
+  than print, centered or shifted toward the left (a Practice-mode
+  complaint directly caused by the old centering bug), still scores well —
+  across the widest/shortest glyphs (ౠ, ఘూ, ఝౄ, మౄ) that were both worst-hit
+  by the centering bug and, separately, by a since-fixed
+  bounding-box-normalization gap for extreme-aspect-ratio glyphs (see
+  `NORMALIZE_MIN_EXTENT_MASK_RATIO` in `js/app.js`).
+- `tests/test_shape_recognition.py` — the shape/pattern-recognition scoring
+  dimension: a reported gap where a scribble that just fills the space
+  where a letter's guide appears could score a high match, because
+  coverage/precision only measure area overlap, not whether the ink is
+  actually *patterned* like the letter. Proves every "real attempt"
+  simulation (a filled copy, a thinner/weighted copy, a distorted copy,
+  even a bare stroked outline) reads as recognizably the letter, while
+  every deliberately letter-*unshaped* scribble (a dense criss-cross fill,
+  a zig-zag, a plain solid block, an edge-hugging scribble) reads as not —
+  and correctly fails to pass Trace mode — across the same representative
+  letter spread used for the scoring-calibration suite.
 - `tests/test_regression.py` — the original functional + visual regression
   pass: drawing/Clear/Done, progress persistence, light/dark sky themes,
   iPad glyph-centering (the original iPad cutoff bug), and
@@ -230,6 +278,8 @@ python3 tests/test_practice_mode.py
 python3 tests/test_chapters.py
 python3 tests/test_scoring_calibration.py
 python3 tests/test_glyph_fit.py
+python3 tests/test_centering.py
+python3 tests/test_shape_recognition.py
 python3 tests/test_regression.py
 ```
 
@@ -251,6 +301,8 @@ tests/test_practice_mode.py Playwright: cluster regrouping, Practice mode scorin
 tests/test_chapters.py   Playwright: గుణింతం generation, collapsible chapters, letter picker
 tests/test_scoring_calibration.py Playwright: trace/practice scoring recalibration
 tests/test_glyph_fit.py  Playwright: every letter fits inside the canvas
+tests/test_centering.py  Playwright: pixel-probe glyph centering (all 592 letters), off-center scoring
+tests/test_shape_recognition.py Playwright: zone-density shape/pattern-match scoring
 tests/test_regression.py Playwright: drawing, themes, iPad centering, motion
 PROMPT.md                The design/engineering brief this app was built from
 ```

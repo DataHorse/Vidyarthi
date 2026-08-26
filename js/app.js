@@ -48,12 +48,112 @@
   // ink bounding box (independently per axis) before comparing shapes, so
   // grading tracks "is this legibly the right letter" rather than "does this
   // match the printed size/position exactly". Two guards keep that from being
-  // gameable: NORMALIZE_MIN_EXTENT_RATIO refuses to stretch an axis that's
+  // gameable: a per-axis minimum extent refuses to stretch an axis that's
   // still too thin to be a real stroke (so a stray dot/tap can't be blown up
   // into "filled the box"), and NORMALIZE_MAX_SCALE caps how far anything can
   // be stretched either way.
+  //
+  // That minimum extent used to be a single fixed fraction of SCORE_SIZE
+  // (NORMALIZE_MIN_EXTENT_RATIO alone), which quietly broke naturally
+  // short/narrow glyphs: ఱు's vocalic-R vowel sign (ౠ), for example, is
+  // itself only ~22px tall out of a 96px grid, so a fairly-drawn, correctly
+  // *proportioned* smaller copy has a raw height well under the fixed
+  // 14.4px floor and got refused a vertical stretch entirely — collapsing
+  // its coverage even though the child drew it right. The floor now also
+  // scales down with how short/narrow the glyph's *own* mask already is
+  // (NORMALIZE_MIN_EXTENT_MASK_RATIO), so an axis only gets refused a
+  // stretch when it's implausibly thin *relative to the letter it's
+  // supposed to be*, not just thin in absolute pixels.
   const NORMALIZE_MIN_EXTENT_RATIO = 0.15;
+  const NORMALIZE_MIN_EXTENT_MASK_RATIO = 0.4;
   const NORMALIZE_MAX_SCALE = 4;
+
+  // ---------- Shape recognition ("did they actually draw the letter, or
+  // just fill the space where it goes?") ----------
+  //
+  // coverage/precision (above) only ask "how much of the letter's stroke
+  // path got inked" and "how much of the child's ink landed on the letter"
+  // — both are purely about *area overlap* with the target shape. That
+  // makes them gameable in a specific, important way a learning app can't
+  // allow: a scribble that densely criss-crosses the whole drawing box
+  // overlaps a large fraction of *any* letter's shape almost by accident,
+  // since it has ink almost everywhere. Two real trace/practice attempts
+  // in this app's own test suite exposed exactly that gap before this fix
+  // (see the "dense fill scribble"/"dense zig-zag scribble" cases in
+  // tests/test_scoring_calibration.py and tests/test_practice_mode.py).
+  //
+  // The fix asks a different, shape-aware question, based on how a human
+  // actually judges "does this look like the letter": not just *whether*
+  // ink landed on the shape, but whether the ink is *distributed* the way
+  // the letter's own strokes are — dense where the letter has strokes,
+  // sparse/empty in its gaps and counters, exactly like a person glancing
+  // at both drawings would compare them. This is the classical OCR
+  // "zoning" technique: divide the drawing into an N x N grid of zones,
+  // build a density signature (how much ink is in each zone) for both the
+  // child's drawing and the letter's own core stroke path, and measure how
+  // well the two *patterns* correlate — not just how much they overlap.
+  //
+  // A scribble that fills the box roughly evenly produces a close-to-flat
+  // density signature (every zone has similar ink), which has little to no
+  // variance to correlate with anything — it reads as "not really shaped
+  // like the letter" even where it happens to overlap the letter's area
+  // well. A real trace's signature — dense in the letter's strokes, close
+  // to empty in its background/counters — correlates strongly with the
+  // letter's own signature, because it *is* the same pattern at a rough
+  // approximation. This is deliberately independent of coverage/precision
+  // (which measure area, not pattern) and independent of exact positioning
+  // (grading is zone-level, not pixel-level, so it tolerates a wobbly hand).
+  const SHAPE_GRID_N = 8; // an 8x8 zone grid over the SCORE_SIZE canvas
+  const SHAPE_ZONE = SCORE_SIZE / SHAPE_GRID_N; // must divide SCORE_SIZE evenly
+  // Trace-mode pass gate on the 0-1 shape score. Calibrated empirically
+  // (see tests/test_shape_recognition.py) against this app's own test
+  // fixtures: every real-attempt simulation this suite has — pixel-perfect
+  // fills, weighted/jittered "good handwriting" fills, distorted (narrower/
+  // shorter) copies, and even a thin *stroked outline* of the glyph rather
+  // than a filled one (the least letter-shaped a real trace ever gets) —
+  // scores shape >= ~0.87 across all 592 letters' representative sample.
+  // Every scribble/scribble-like simulation (edge-hugging lines, a dense
+  // zig-zag, a dense criss-cross fill, a plain solid block over the
+  // letter's area) tops out around ~0.75, even on the widest glyphs where
+  // scribbles get the most incidental help. 0.78 sits in the middle of
+  // that gap with margin on both sides.
+  const SHAPE_MIN_MATCH = 0.78;
+  // percentScore() blends the shape score in as a factor, but never lets it
+  // crush the score to near-zero on its own the way a straight product
+  // would — a floor keeps a so-so-but-real attempt from reading as "no
+  // shape at all" purely from grid-quantization noise on short/thin
+  // glyphs, while a strong shape match still visibly rewards a drawing
+  // that's genuinely well-formed, not just well-covered.
+  const SHAPE_SCORE_FLOOR = 0.55;
+
+  // Pearson correlation coefficient between two equal-length numeric
+  // vectors, i.e. "do these two patterns rise and fall together". Returns
+  // 0 (not NaN) when either vector has ~zero variance — a flat, uniform
+  // signature (an even scribble, or a totally empty grid) can't be said to
+  // correlate with anything, positively or negatively.
+  function pearsonCorrelation(a, b) {
+    const n = a.length;
+    let sumA = 0,
+      sumB = 0;
+    for (let i = 0; i < n; i++) {
+      sumA += a[i];
+      sumB += b[i];
+    }
+    const meanA = sumA / n,
+      meanB = sumB / n;
+    let num = 0,
+      denA = 0,
+      denB = 0;
+    for (let i = 0; i < n; i++) {
+      const da = a[i] - meanA,
+        db = b[i] - meanB;
+      num += da * db;
+      denA += da * da;
+      denB += db * db;
+    }
+    if (denA < 1e-9 || denB < 1e-9) return 0;
+    return num / Math.sqrt(denA * denB);
+  }
 
   const SUCCESS_MESSAGES = ["Great job!", "Wonderful!", "You did it!", "Super tracing!", "Amazing!"];
   const RETRY_MESSAGES = [
@@ -409,56 +509,73 @@
   // glyph into a w x h box, used identically for both the guide layer and
   // the trace-accuracy mask so the two always line up exactly.
   //
-  // Starts from a standard size (GUIDE_BASE_RATIO of the box width) and
-  // then checks the glyph's *actual measured ink* — not its advance-box —
-  // against a hard cap (GUIDE_MAX_INK_RATIO of the box). Some Telugu
-  // letters/conjuncts (e.g. ౠ, క్ష) render with ink noticeably larger than
-  // the base size assumes, which clipped against the canvas edge; shrinking
-  // per-letter to fit keeps every glyph fully inside the drawing box.
+  // This used to trust ctx.measureText()'s actualBoundingBox* metrics to
+  // find the glyph's true ink extent (both for the shrink-to-fit check and
+  // for centering). That metric turned out to be unreliable for Telugu
+  // conjuncts/vowel-sign combinations on WebKit/Safari (iPadOS/iOS) —
+  // letters would render visibly off-center (typically shifted right) and
+  // sometimes clip against the canvas edge, even though the same code
+  // measured and centered correctly in Chromium. Rather than trust ANY
+  // browser's text-metrics API, this now renders the glyph to a scratch
+  // canvas and reads back the actual painted pixels (inkBBox) to find its
+  // real ink extent — a canvas cannot lie about what it actually rendered,
+  // so this is correct on every browser by construction, not by testing
+  // against whichever ones happen to be available to check.
   const GUIDE_BASE_RATIO = 0.68;
   const GUIDE_MAX_INK_RATIO = 0.82;
+  const INK_ALPHA_THRESHOLD = 40;
 
   function computeGlyphLayout(ctx, telugu, w, h) {
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
 
-    let size = w * GUIDE_BASE_RATIO;
-    ctx.font = `900 ${size}px "Noto Sans Telugu", sans-serif`;
-    let m = ctx.measureText(telugu);
-
-    const hasInkBox =
-      typeof m.actualBoundingBoxLeft === "number" &&
-      typeof m.actualBoundingBoxRight === "number" &&
-      typeof m.actualBoundingBoxAscent === "number" &&
-      typeof m.actualBoundingBoxDescent === "number";
-
-    if (hasInkBox) {
-      const inkWidth = m.actualBoundingBoxLeft + m.actualBoundingBoxRight;
-      const inkHeight = m.actualBoundingBoxAscent + m.actualBoundingBoxDescent;
-      const maxW = w * GUIDE_MAX_INK_RATIO;
-      const maxH = h * GUIDE_MAX_INK_RATIO;
-      const scale = Math.min(1, maxW / inkWidth, maxH / inkHeight);
-      if (isFinite(scale) && scale > 0 && scale < 1) {
-        size *= scale;
-        ctx.font = `900 ${size}px "Noto Sans Telugu", sans-serif`;
-        m = ctx.measureText(telugu);
-      }
+    // Renders the glyph at the given size/anchor purely to read back where
+    // its ink actually landed. Always clears ctx before returning so the
+    // caller (or the next probe) starts from a clean canvas.
+    function probeInk(size, ax, ay) {
+      ctx.clearRect(0, 0, w, h);
+      ctx.font = `900 ${size}px "Noto Sans Telugu", sans-serif`;
+      ctx.fillStyle = "#000";
+      ctx.fillText(telugu, ax, ay);
+      const box = inkBBox(ctx.getImageData(0, 0, w, h).data, w, h);
+      ctx.clearRect(0, 0, w, h);
+      return box;
     }
 
-    // `textAlign: "center"` centers the glyph's *advance* width, not its
-    // visual ink. For Telugu conjuncts/vowel-signs the two can differ a lot
-    // (this shows up worst on WebKit/Safari, e.g. iPad), so nudge the draw
-    // position using the actual measured ink box to truly center it.
+    const maxW = w * GUIDE_MAX_INK_RATIO;
+    const maxH = h * GUIDE_MAX_INK_RATIO;
+
+    let size = w * GUIDE_BASE_RATIO;
     let anchorX = w / 2;
-    let anchorY = h / 2 + h * 0.03;
-    if (
-      typeof m.actualBoundingBoxLeft === "number" &&
-      typeof m.actualBoundingBoxRight === "number" &&
-      typeof m.actualBoundingBoxAscent === "number" &&
-      typeof m.actualBoundingBoxDescent === "number"
-    ) {
-      anchorX += (m.actualBoundingBoxLeft - m.actualBoundingBoxRight) / 2;
-      anchorY += (m.actualBoundingBoxAscent - m.actualBoundingBoxDescent) / 2;
+    let anchorY = h / 2;
+
+    // Iterate: measure -> recenter on the actual ink -> shrink if it's
+    // still too big -> re-verify. A single measure-and-shrink pass can
+    // leave a razor-thin (sub-pixel-rounding) margin for some conjuncts
+    // once the scale is applied, which font hinting at the new size can
+    // then tip back into clipping — so this re-checks the *actual* result
+    // at each step instead of trusting one computed scale factor, and
+    // keeps a small safety margin below the nominal max-ink ratio.
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const box = probeInk(size, anchorX, anchorY);
+      if (!box) break; // no ink measured — nothing more this can correct
+
+      anchorX += w / 2 - (box.minX + box.w / 2);
+      anchorY += h / 2 - (box.minY + box.h / 2);
+
+      if (box.w > maxW || box.h > maxH) {
+        const scale = Math.min(maxW / box.w, maxH / box.h) * 0.96;
+        size *= scale;
+        continue; // re-measure at the new size before trusting it
+      }
+
+      // Re-probe once more at the corrected anchor (centering shifts where
+      // the ink actually lands) and confirm it's genuinely inside the box.
+      const check = probeInk(size, anchorX, anchorY);
+      if (check && check.minX >= 0 && check.maxX < w && check.minY >= 0 && check.maxY < h) {
+        return { size, anchorX, anchorY };
+      }
+      size *= 0.97; // still clipping somehow (rounding/hinting) — nudge down and retry
     }
 
     return { size, anchorX, anchorY };
@@ -638,7 +755,7 @@
   // meant to require, so a genuinely accurate trace can score close to 100%.
   let scoreMaskCache = null; // { letterId, coreData, dilatedData, maskBox }
 
-  // Scans an RGBA buffer for its ink bounding box (alpha > 40), in pixel
+  // Scans an RGBA buffer for its ink bounding box (alpha > INK_ALPHA_THRESHOLD), in pixel
   // coordinates. Returns null if there's no ink at all.
   function inkBBox(data, w, h) {
     let minX = w,
@@ -648,7 +765,7 @@
     for (let y = 0; y < h; y++) {
       const rowOffset = y * w;
       for (let x = 0; x < w; x++) {
-        if (data[(rowOffset + x) * 4 + 3] > 40) {
+        if (data[(rowOffset + x) * 4 + 3] > INK_ALPHA_THRESHOLD) {
           if (x < minX) minX = x;
           if (x > maxX) maxX = x;
           if (y < minY) minY = y;
@@ -710,7 +827,7 @@
     // back to the bold fill itself as the core — better a slightly stricter
     // target than a mask with (near-)nothing to hit.
     let coreCount = 0;
-    for (let i = 3; i < coreData.length; i += 4) if (coreData[i] > 40) coreCount++;
+    for (let i = 3; i < coreData.length; i += 4) if (coreData[i] > INK_ALPHA_THRESHOLD) coreCount++;
     if (coreCount < 8 && maskBox) {
       coreData = solidData;
     }
@@ -737,10 +854,10 @@
     const rawData = sctx.getImageData(0, 0, SCORE_SIZE, SCORE_SIZE).data;
 
     let rawInkCount = 0;
-    for (let i = 3; i < rawData.length; i += 4) if (rawData[i] > 40) rawInkCount++;
+    for (let i = 3; i < rawData.length; i += 4) if (rawData[i] > INK_ALPHA_THRESHOLD) rawInkCount++;
 
     if (rawInkCount < MIN_INK_PIXELS || !maskBox) {
-      return { coverage: 0, precision: 0, drawCount: rawInkCount, maskCount: 0 };
+      return { coverage: 0, precision: 0, shape: 0, drawCount: rawInkCount, maskCount: 0 };
     }
 
     // Re-fit the child's ink onto the glyph's own ink bounding box (see the
@@ -754,9 +871,10 @@
     let scoredData = rawData;
     const srcBox = inkBBox(rawData, SCORE_SIZE, SCORE_SIZE);
     if (srcBox) {
-      const minExtent = SCORE_SIZE * NORMALIZE_MIN_EXTENT_RATIO;
-      let scaleX = srcBox.w >= minExtent ? maskBox.w / srcBox.w : 1;
-      let scaleY = srcBox.h >= minExtent ? maskBox.h / srcBox.h : 1;
+      const minExtentX = Math.min(SCORE_SIZE * NORMALIZE_MIN_EXTENT_RATIO, maskBox.w * NORMALIZE_MIN_EXTENT_MASK_RATIO);
+      const minExtentY = Math.min(SCORE_SIZE * NORMALIZE_MIN_EXTENT_RATIO, maskBox.h * NORMALIZE_MIN_EXTENT_MASK_RATIO);
+      let scaleX = srcBox.w >= minExtentX ? maskBox.w / srcBox.w : 1;
+      let scaleY = srcBox.h >= minExtentY ? maskBox.h / srcBox.h : 1;
       scaleX = Math.min(NORMALIZE_MAX_SCALE, Math.max(1, scaleX));
       scaleY = Math.min(NORMALIZE_MAX_SCALE, Math.max(1, scaleY));
 
@@ -779,53 +897,91 @@
       scoredInkCount = 0,
       insideCoreCount = 0,
       insideDilatedCount = 0;
+    // Per-zone ink tallies for the shape/pattern-match check (see the
+    // SHAPE_* comment above) — accumulated in this same pass rather than a
+    // second scan over the pixel data.
+    const zoneCount = SHAPE_GRID_N * SHAPE_GRID_N;
+    const coreZones = new Float64Array(zoneCount);
+    const drawZones = new Float64Array(zoneCount);
     const n = SCORE_SIZE * SCORE_SIZE;
     for (let i = 0; i < n; i++) {
       const a = i * 4 + 3;
-      const coreInk = coreData[a] > 40;
-      const dilatedInk = dilatedData[a] > 40;
-      const drawInk = scoredData[a] > 40;
+      const coreInk = coreData[a] > INK_ALPHA_THRESHOLD;
+      const dilatedInk = dilatedData[a] > INK_ALPHA_THRESHOLD;
+      const drawInk = scoredData[a] > INK_ALPHA_THRESHOLD;
       if (coreInk) coreCount++;
       if (drawInk) {
         scoredInkCount++;
         if (coreInk) insideCoreCount++;
         if (dilatedInk) insideDilatedCount++;
       }
+      if (coreInk || drawInk) {
+        const x = i % SCORE_SIZE;
+        const y = (i - x) / SCORE_SIZE;
+        const zone = ((y / SHAPE_ZONE) | 0) * SHAPE_GRID_N + ((x / SHAPE_ZONE) | 0);
+        if (coreInk) coreZones[zone]++;
+        if (drawInk) drawZones[zone]++;
+      }
     }
 
     const coverage = coreCount ? insideCoreCount / coreCount : 0;
     const precision = scoredInkCount ? insideDilatedCount / scoredInkCount : 0;
+    // shape: how well the child's ink *pattern* (dense/sparse by zone)
+    // correlates with the letter's own core-stroke pattern, independent of
+    // how much area overlaps — see the SHAPE_* comment above. Clamped to
+    // [0, 1]: a negative correlation is just as "not this letter" as no
+    // correlation at all, for scoring purposes.
+    const shape = Math.max(0, Math.min(1, pearsonCorrelation(coreZones, drawZones)));
     // drawCount reports the child's *actual* ink amount (not the resized
     // copy used for shape comparison) — it's only ever used to gate "did
     // they draw enough to grade at all", which must reflect the real attempt.
-    return { coverage, precision, drawCount: rawInkCount, maskCount: coreCount };
+    return { coverage, precision, shape, drawCount: rawInkCount, maskCount: coreCount };
   }
 
   function gradeAttempt(letter) {
     if (!hasInk) return { verdict: "empty" };
     const result = scoreDrawing(letter);
     if (result.drawCount < MIN_INK_PIXELS) return { verdict: "empty", result };
-    const passed = result.coverage >= COVERAGE_MIN && result.precision >= PRECISION_MIN && percentScore(result) >= PASS_MATCH_MIN;
+    // shape >= SHAPE_MIN_MATCH is a hard, independent gate alongside
+    // coverage/precision (see the SHAPE_* comment above scoreDrawing) — a
+    // scribble that racks up moderate-to-good coverage and precision
+    // purely by spanning a lot of the box still won't pass unless its ink
+    // is actually *patterned* like the letter's own strokes, not just
+    // sitting on top of them.
+    const passed =
+      result.coverage >= COVERAGE_MIN &&
+      result.precision >= PRECISION_MIN &&
+      result.shape >= SHAPE_MIN_MATCH &&
+      percentScore(result) >= PASS_MATCH_MIN;
     return { verdict: passed ? "pass" : "retry", result };
   }
 
-  // Turns a {coverage, precision} pair into a single 0-100 "match" percentage
-  // for Practice mode, by multiplying them rather than averaging. A product
-  // needs BOTH numbers to be genuinely good to score well — a plain average
-  // (or a harmonic mean/F1) lets one so-so metric coast on the other being
-  // high, which is exactly how a dense, spread-out scribble sneaks through:
-  // criss-crossing enough of the box tends to rack up *moderate* coverage
-  // and *moderate* precision at once (each around 0.5-0.7) purely by
-  // covering a lot of ground, and an average of two moderate numbers is
-  // still moderate. Multiplying punishes that combination hard (0.6 x 0.6 is
-  // only 0.36) while barely denting a real letter, where both numbers are
-  // already high (0.9 x 0.95 stays 0.85) — so it rewards a shape that's
-  // genuinely both complete *and* on-target, not just "covered a lot of the
-  // box somehow".
+  // Turns a {coverage, precision, shape} triple into a single 0-100 "match"
+  // percentage for Practice mode. coverage/precision are multiplied (not
+  // averaged) for the reason explained where they're computed: a plain
+  // average lets one so-so metric coast on the other being high, which is
+  // exactly how a dense, spread-out scribble sneaks through — criss-crossing
+  // enough of the box tends to rack up *moderate* coverage and *moderate*
+  // precision at once (each around 0.5-0.7) purely by covering a lot of
+  // ground. Multiplying punishes that hard (0.6 x 0.6 is only 0.36) while
+  // barely denting a real letter, where both numbers are already high
+  // (0.9 x 0.95 stays 0.85).
+  //
+  // shape is blended in as a separate factor on top of that product, scaled
+  // between SHAPE_SCORE_FLOOR and 1 rather than 0 and 1 — unlike
+  // coverage/precision, shape is a *pattern* comparison over a fairly coarse
+  // grid, so it's naturally noisier for very short/thin glyphs (a couple of
+  // pixels' difference can shift a whole zone's count). Letting it multiply
+  // in from 0 would risk that noise capping an otherwise-excellent trace's
+  // score; a floor keeps its effect proportionate — a strong shape match
+  // still visibly lifts the score, a poor one (a scribble) still visibly
+  // costs it, but it can never on its own be the difference between a great
+  // score and a near-zero one the way coverage/precision can.
   function percentScore(result) {
     if (!result || result.drawCount < MIN_INK_PIXELS) return 0;
-    const { coverage, precision } = result;
-    return Math.round(coverage * precision * 100);
+    const { coverage, precision, shape } = result;
+    const shapeFactor = SHAPE_SCORE_FLOOR + (1 - SHAPE_SCORE_FLOOR) * (shape || 0);
+    return Math.round(coverage * precision * shapeFactor * 100);
   }
 
   // ---------- Practice screen render ----------
@@ -1131,6 +1287,29 @@
       hasInk = true;
     },
     scoreDrawing: () => scoreDrawing(currentLetter()),
+    // Exposes the bounding-box-normalization intermediates from inside
+    // scoreDrawing() (srcBox/maskBox/scaleX/scaleY) for diagnosing scoring
+    // weaknesses tied to NORMALIZE_MIN_EXTENT_RATIO on extreme-aspect-ratio
+    // glyphs — not used by the app itself, only by the test suite.
+    debugNormalizeForTest: () => {
+      const letter = currentLetter();
+      const { maskBox } = getMasks(letter);
+      const sample = document.createElement("canvas");
+      sample.width = SCORE_SIZE;
+      sample.height = SCORE_SIZE;
+      const sctx = sample.getContext("2d");
+      sctx.drawImage(drawCanvas, 0, 0, drawCanvas.width, drawCanvas.height, 0, 0, SCORE_SIZE, SCORE_SIZE);
+      const rawData = sctx.getImageData(0, 0, SCORE_SIZE, SCORE_SIZE).data;
+      const srcBox = inkBBox(rawData, SCORE_SIZE, SCORE_SIZE);
+      if (!srcBox || !maskBox) return { srcBox, maskBox };
+      const minExtentX = Math.min(SCORE_SIZE * NORMALIZE_MIN_EXTENT_RATIO, maskBox.w * NORMALIZE_MIN_EXTENT_MASK_RATIO);
+      const minExtentY = Math.min(SCORE_SIZE * NORMALIZE_MIN_EXTENT_RATIO, maskBox.h * NORMALIZE_MIN_EXTENT_MASK_RATIO);
+      let scaleX = srcBox.w >= minExtentX ? maskBox.w / srcBox.w : 1;
+      let scaleY = srcBox.h >= minExtentY ? maskBox.h / srcBox.h : 1;
+      scaleX = Math.min(NORMALIZE_MAX_SCALE, Math.max(1, scaleX));
+      scaleY = Math.min(NORMALIZE_MAX_SCALE, Math.max(1, scaleY));
+      return { srcBox, maskBox, minExtentX, minExtentY, scaleX, scaleY };
+    },
     gradeAttempt: () => gradeAttempt(currentLetter()),
     isPracticeMode: () => practiceMode,
     getPracticeBest: () => ({ ...practiceBest }),
@@ -1139,7 +1318,7 @@
       const ctx = c.getContext("2d");
       const data = ctx.getImageData(0, 0, c.width, c.height).data;
       let n = 0;
-      for (let i = 3; i < data.length; i += 4) if (data[i] > 40) n++;
+      for (let i = 3; i < data.length; i += 4) if (data[i] > INK_ALPHA_THRESHOLD) n++;
       return n;
     },
     // Paints a pixel-accurate fill of the current letter onto the draw

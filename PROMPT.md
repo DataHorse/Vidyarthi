@@ -102,39 +102,57 @@ A "learn to write the Telugu alphabet" practice app for children, v1 scope:
 4. **Check trace accuracy, honestly — and score legibility, not print-
    exactness.** Sample the child's drawing against the letter's actual shape
    (masks built from the same glyph/layout, so everything stays aligned) and
-   score two things: *coverage* and *precision*. Precision is measured
-   against a *dilated* mask (the glyph's bold fill plus a tolerance halo) —
-   how much of the child's ink landed reasonably close to the letter.
-   Coverage is measured against a *core* mask: the very same glyph, at the
-   very same size and position, rendered at a much **thinner font weight**
-   than the bold guide glyph — not the bold shape itself. A real pen stroke,
-   even a careful and accurate one, can never fill a boldly-printed guide
-   glyph's full thick interior, so grading coverage against that full bold
-   shape quietly capped even a genuinely good trace's score well below what
-   it visually deserved (a drawing that looked like a clean, close match
-   could score barely over half). Grading against a thinner-stroked
-   rendering of the same letter instead asks "did the ink pass through the
-   letter's real stroke path" rather than "did the ink fill this bold
-   glyph edge-to-edge" — which a real pen stroke can actually achieve. Before
-   comparing, re-fit the child's own ink bounding box onto the glyph's own
-   ink bounding box (computed from the bold fill), independently per axis
-   and scale-up only — a touchscreen drawing is essentially never the
-   printed glyph's exact size, position, or proportions (especially with no
-   guide underneath, in Practice mode), and grading should track "is this
+   score three things: *coverage*, *precision*, and *shape*. Precision is
+   measured against a *dilated* mask (the glyph's bold fill plus a tolerance
+   halo) — how much of the child's ink landed reasonably close to the
+   letter. Coverage is measured against a *core* mask: the very same glyph,
+   at the very same size and position, rendered at a much **thinner font
+   weight** than the bold guide glyph — not the bold shape itself. A real
+   pen stroke, even a careful and accurate one, can never fill a boldly-
+   printed guide glyph's full thick interior, so grading coverage against
+   that full bold shape quietly capped even a genuinely good trace's score
+   well below what it visually deserved (a drawing that looked like a clean,
+   close match could score barely over half). Grading against a thinner-
+   stroked rendering of the same letter instead asks "did the ink pass
+   through the letter's real stroke path" rather than "did the ink fill this
+   bold glyph edge-to-edge" — which a real pen stroke can actually achieve.
+   Before comparing, re-fit the child's own ink bounding box onto the
+   glyph's own ink bounding box (computed from the bold fill), independently
+   per axis and scale-up only — a touchscreen drawing is essentially never
+   the printed glyph's exact size, position, or proportions (especially with
+   no guide underneath, in Practice mode), and grading should track "is this
    legibly the right letter" rather than "does this match the print
-   exactly". Two guards keep that normalization from being gamed: a stray
-   dot/tap is too thin on both axes to qualify, and how far anything can be
-   stretched is capped, so a scribble spanning most of the box never gets
-   shrunk down to fake a tight match. Coverage and precision must each clear
-   a threshold to pass, *and* their product must also clear its own
-   threshold — the two independent thresholds alone let a scribble that
+   exactly". A stray dot/tap is too thin on both axes to qualify (that
+   threshold scales down for glyphs that are themselves naturally short or
+   narrow, like ౠ's vowel sign, so a fairly-proportioned small copy of a
+   wide/short letter isn't unfairly refused a stretch), and how far anything
+   can be stretched is capped, so a scribble spanning most of the box never
+   gets shrunk down to fake a tight match.
+
+   Coverage and precision alone are still only an *area-overlap* test —
+   "did ink land on the shape" — which a scribble that densely fills most of
+   the drawing box can satisfy by accident, without being shaped anything
+   like the letter. *Shape* is a genuine pattern-recognition check that
+   closes that gap: divide the drawing into an 8x8 grid of zones, build an
+   ink-density signature per zone for both the child's drawing and the
+   letter's own core stroke path, and measure how well the two *patterns*
+   correlate (the classical OCR "zoning" technique) — dense where the
+   letter has strokes, sparse in its gaps and counters, the same way a
+   person visually compares two drawings rather than just checking whether
+   ink is "on" the letter. A scribble that fills the box roughly evenly
+   produces a close-to-flat signature with little to correlate against
+   anything; a real trace's signature — even an imprecise one — resembles
+   the letter's own, because it approximately *is* the letter's own
+   pattern. Coverage and precision must each clear a threshold to pass,
+   shape must independently clear its own threshold, *and* the overall
+   match percentage (their blended product) must also clear its own
+   threshold — the coverage/precision thresholds alone let a scribble that
    spans most of the drawing box rack up moderate-moderate on both at once
-   purely by covering a lot of ground; requiring the product to also be
-   genuinely good closes that gap the same way Practice mode's percentage
-   already resisted it (see goal 5) — while a pixel-accurate trace can still
-   score close to 100%. A blank canvas or an off-target scribble gets an
-   encouraging "try again" message instead of false praise, and is never
-   marked practiced or auto-advanced.
+   purely by covering a lot of ground; the shape check closes the deeper gap
+   of "covered a lot of ground without looking anything like the letter",
+   while a pixel-accurate trace can still score close to 100%. A blank
+   canvas or an off-target scribble gets an encouraging "try again" message
+   instead of false praise, and is never marked practiced or auto-advanced.
 5. Offer a **Practice mode**: a toggle next to Trace mode that swaps the
    dashed-outline guide for a completely blank box — no outline at all — so
    a child can test whether they've actually memorized a letter's shape,
@@ -161,9 +179,12 @@ A "learn to write the Telugu alphabet" practice app for children, v1 scope:
 
 ## Non-goals for v1
 
-- No real handwriting-recognition (stroke order, direction, or OCR-grade
-  shape matching) — the trace-accuracy check (goal 4 above) is a coverage/
-  precision heuristic, not a recognizer, and is intentionally lenient.
+- No *stroke-order or stroke-direction* recognition — the trace-accuracy
+  check (goal 4 above) grades the finished ink's coverage, precision, and
+  zone-density shape pattern against the letter, all independent of the
+  order or direction strokes were drawn in, and is intentionally lenient
+  about wobble, size, and position while still requiring the ink to
+  actually be patterned like the letter (not just present near it).
 - No user accounts, no backend, no analytics, no ads.
 - No recorded native-speaker audio files. v1 uses the on-device
   `SpeechSynthesis` Web Speech API, explicitly selecting the best available
