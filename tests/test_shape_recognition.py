@@ -152,7 +152,7 @@ def clear(page):
 
 def score_and_result(page):
     r = page.evaluate("window.__vidyarthiTest.scoreDrawing()")
-    pct = round(r["coverage"] * r["precision"] * (0.55 + 0.45 * (r.get("shape") or 0)) * 100)
+    pct = round(r["coverage"] * r["precision"] * max(0, r.get("shape") or 0) ** 2 * 100)
     return pct, r
 
 
@@ -208,6 +208,19 @@ def main():
                     f"{tel}: {label} does not pass Trace mode (shape gate)",
                     grade["verdict"] != "pass",
                     f"got {grade}",
+                )
+                # The displayed match percentage itself must read as low —
+                # not just fail the pass gate. A solid rectangle filled over
+                # the letter's area trivially gets coverage=1.0 (every core
+                # pixel sits under solid ink) and moderate-to-good precision
+                # purely from covering a lot of ground, so shape has to do
+                # real, visible work here — this is the exact scenario a
+                # too-forgiving shape-blend (a floor that could only ever
+                # cut the score by 45%) let through at ~45% before.
+                check(
+                    f"{tel}: {label} shows a genuinely low match percentage (<30)",
+                    pct < 30,
+                    f"got {pct} ({r})",
                 )
 
         browser.close()

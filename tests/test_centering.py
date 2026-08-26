@@ -15,6 +15,26 @@ reads back actual rendered pixels instead), which is what makes the fix
 browser-independent rather than tuned to whichever browser happened to be
 available to test against.
 
+Critically, VIEWPORTS below includes device_scale_factor (devicePixelRatio)
+values matching real iPad/iPhone hardware (2 and 3), not just Playwright's
+default of 1. A first attempt at this fix replaced measureText() with a
+pixel-probe that read back rendered pixels via ctx.getImageData() — correct
+in principle, but it probed directly on the *live*, on-screen canvas
+context, which setupCanvasSize() scales with ctx.setTransform(dpr, ...) so
+CSS-pixel coordinates map correctly onto the physical backing store.
+getImageData() always reads back *physical* pixels and completely ignores
+that transform, so probing on the live context sampled the wrong region of
+the backing store on any device where devicePixelRatio != 1 — invisible in
+this whole suite when every test ran at the implicit default dpr=1 (where
+CSS pixels and device pixels are numerically identical, masking the bug
+completely), but severe on real hardware: reproducing it against the
+previous commit at device_scale_factor=3 showed letters landing as far off
+as cx=0.11/cy=0.07 (versus the correct 0.5/0.5) and clipping against the
+canvas edge on nearly every sampled letter. computeGlyphLayout now probes
+on a dedicated, never-transformed scratch canvas instead (see app.js), so
+this suite running dpr=2/3 cases and passing is the actual regression
+guard — dpr=1 alone would have passed on the broken version too.
+
 Because the guide layer and the scoring masks (core/dilated) are built from
 the very same computeGlyphLayout() call and cached together per letter (see
 getMasks() in app.js), a genuinely centered guide also means a genuinely
@@ -39,8 +59,10 @@ FAILURES = []
 CENTER_TOLERANCE = 0.06
 
 VIEWPORTS = [
-    ("iPad-ish", 834, 1194),
-    ("iPhone-ish", 390, 844),
+    ("iPad-ish @1x", 834, 1194, 1),
+    ("iPad-ish @2x (real iPad dpr)", 834, 1194, 2),
+    ("iPhone-ish @1x", 390, 844, 1),
+    ("iPhone-ish @3x (real iPhone Pro dpr)", 390, 844, 3),
 ]
 
 
@@ -55,8 +77,8 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch()
 
-        for name, vw, vh in VIEWPORTS:
-            ctx = browser.new_context(viewport={"width": vw, "height": vh}, has_touch=True)
+        for name, vw, vh, dpr in VIEWPORTS:
+            ctx = browser.new_context(viewport={"width": vw, "height": vh}, device_scale_factor=dpr, has_touch=True)
             page = ctx.new_page()
             page.goto(BASE)
             page.wait_for_selector(".lesson-card")

@@ -239,30 +239,54 @@ Six Playwright suites drive the app in a real headless browser:
   the ౠ/క్ష/గుణింతం-conjunct-style clipping fix).
 - `tests/test_centering.py` — the real, browser-independent fix for a
   reported bug: on iPad, some letters rendered off-center (usually shifted
-  right) with part of the glyph clipped, because glyph layout trusted
+  right) with part of the glyph clipped. Glyph layout originally trusted
   `ctx.measureText()`'s `actualBoundingBox*` metrics, which turned out to
-  be unreliable for Telugu conjuncts/vowel-sign combinations on WebKit.
-  Layout now reads back *actual rendered pixels* (a pixel-probe, not a
-  metrics guess) to size and center every glyph, so it no longer depends on
-  any browser's text-metrics accuracy at all. Sweeps all 592 letters at two
-  viewports with a tight 6% centering tolerance (worst observed drift:
-  <0.6%), then proves the practical consequence — a letter drawn smaller
-  than print, centered or shifted toward the left (a Practice-mode
-  complaint directly caused by the old centering bug), still scores well —
-  across the widest/shortest glyphs (ౠ, ఘూ, ఝౄ, మౄ) that were both worst-hit
-  by the centering bug and, separately, by a since-fixed
-  bounding-box-normalization gap for extreme-aspect-ratio glyphs (see
-  `NORMALIZE_MIN_EXTENT_MASK_RATIO` in `js/app.js`).
+  be unreliable for Telugu conjuncts/vowel-sign combinations on WebKit; a
+  first fix replaced that with a *pixel-probe* (render the glyph, read back
+  actually-rendered pixels via `ctx.getImageData()`, size/center from that)
+  — correct in principle, but it still didn't fix the bug in production,
+  because it probed directly on the live on-screen canvas context, which is
+  scaled by `ctx.setTransform(devicePixelRatio, ...)`. `getImageData()`
+  always reads back *physical* canvas pixels and completely ignores that
+  transform, so probing on a live, dpr-scaled context reads the wrong
+  region of the backing store on any device where devicePixelRatio != 1 —
+  invisible in headless testing at the implicit default dpr=1, severe on
+  real iPad/iPhone hardware (dpr 2-3). The fix now probes on a dedicated,
+  *never*-transformed scratch canvas instead, so measuring and drawing
+  always happen in the same coordinate space regardless of device. This
+  suite sweeps all 592 letters across both dpr=1 *and* real-hardware dpr
+  values (2 for iPad, 3 for iPhone Pro) with a tight 6% centering
+  tolerance — dpr=1 alone would have passed on the broken version too, so
+  the dpr-scaled runs are the actual regression guard — then proves the
+  practical consequence — a letter drawn smaller than print, centered or
+  shifted toward the left (a Practice-mode complaint directly caused by the
+  old centering bug), still scores well — across the widest/shortest
+  glyphs (ౠ, ఘూ, ఝౄ, మౄ) that were both worst-hit by the centering bug and,
+  separately, by a since-fixed bounding-box-normalization gap for
+  extreme-aspect-ratio glyphs (see `NORMALIZE_MIN_EXTENT_MASK_RATIO` in
+  `js/app.js`).
 - `tests/test_shape_recognition.py` — the shape/pattern-recognition scoring
   dimension: a reported gap where a scribble that just fills the space
   where a letter's guide appears could score a high match, because
   coverage/precision only measure area overlap, not whether the ink is
-  actually *patterned* like the letter. Proves every "real attempt"
-  simulation (a filled copy, a thinner/weighted copy, a distorted copy,
-  even a bare stroked outline) reads as recognizably the letter, while
-  every deliberately letter-*unshaped* scribble (a dense criss-cross fill,
-  a zig-zag, a plain solid block, an edge-hugging scribble) reads as not —
-  and correctly fails to pass Trace mode — across the same representative
+  actually *patterned* like the letter. A first version blended shape into
+  the match percentage via a floor (never letting it cut the score by more
+  than 45%), which left an exact gap open: a scribble that densely fills
+  the whole drawing box trivially gets coverage=1.0 (every core pixel sits
+  under solid ink) and moderate-to-good precision, so shape was the *only*
+  defense — and a 45%-max cut landed such a scribble right around a 45%
+  score, matching what was reported. Shape is now squared instead
+  (`shape^2`, no floor) — a steep penalty for the low/moderate shape values
+  every scribble simulation produces, while barely denting a real letter's
+  already-high shape score. Proves every "real attempt" simulation (a
+  filled copy, a thinner/weighted copy, a distorted copy, even a bare
+  stroked outline) reads as recognizably the letter, while every
+  deliberately letter-*unshaped* scribble (a dense criss-cross fill, a
+  zig-zag, a plain solid block, an edge-hugging scribble, and a scribble
+  that solidly fills the entire drawing box) reads as not, shows a
+  genuinely low match percentage (<30%, down from the ~45% previously
+  possible), and correctly fails to pass Trace mode — across the same
+  representative
   letter spread used for the scoring-calibration suite.
 - `tests/test_regression.py` — the original functional + visual regression
   pass: drawing/Clear/Done, progress persistence, light/dark sky themes,

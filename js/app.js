@@ -118,13 +118,26 @@
   // scribbles get the most incidental help. 0.78 sits in the middle of
   // that gap with margin on both sides.
   const SHAPE_MIN_MATCH = 0.78;
-  // percentScore() blends the shape score in as a factor, but never lets it
-  // crush the score to near-zero on its own the way a straight product
-  // would — a floor keeps a so-so-but-real attempt from reading as "no
-  // shape at all" purely from grid-quantization noise on short/thin
-  // glyphs, while a strong shape match still visibly rewards a drawing
-  // that's genuinely well-formed, not just well-covered.
-  const SHAPE_SCORE_FLOOR = 0.55;
+  // percentScore() blends shape in as shape^SHAPE_SCORE_EXPONENT, not a
+  // straight product and not a floor-cushioned one. A first version used a
+  // floor (a minimum factor of 0.55 regardless of how low shape got), on
+  // the theory that shape is a coarser, noisier signal than pixel-level
+  // coverage/precision and shouldn't be able to crush an otherwise-good
+  // score on its own — but real-world testing surfaced exactly the gap
+  // that floor left open: a scribble that solidly fills the whole drawing
+  // box trivially gets coverage=1.0 (every core pixel sits under solid
+  // ink) and moderate-to-good precision (~0.45-0.76, since a filled
+  // rectangle mostly-but-not-entirely overlaps the dilated mask), so shape
+  // was the *only* thing standing between that scribble and a good score —
+  // and a floor of 0.55 meant shape could reduce the final score by at
+  // most 45%, letting a solid-fill scribble land around 45% overall, right
+  // where it was reported. Squaring shape (no floor) keeps that same
+  // "shape alone shouldn't crush a genuinely good match" property for real
+  // attempts, whose shape is always high (>=0.85, so squaring only costs a
+  // few points), while giving low/moderate shape values — exactly where
+  // every scribble simulation in tests/test_shape_recognition.py lands —
+  // a much steeper penalty than a linear floor ever could.
+  const SHAPE_SCORE_EXPONENT = 2;
 
   // Pearson correlation coefficient between two equal-length numeric
   // vectors, i.e. "do these two patterns rise and fall together". Returns
@@ -525,7 +538,28 @@
   const GUIDE_MAX_INK_RATIO = 0.82;
   const INK_ALPHA_THRESHOLD = 40;
 
-  function computeGlyphLayout(ctx, telugu, w, h) {
+  function computeGlyphLayout(telugu, w, h) {
+    // Probing must happen on a plain, never-transformed canvas whose pixel
+    // grid is exactly w x h. getImageData() always reads back *physical*
+    // canvas pixels and completely ignores ctx.setTransform() — so probing
+    // directly on a live canvas that has a devicePixelRatio scale applied
+    // (as every on-screen drawing canvas in this app does, via
+    // setupCanvasSize's ctx.setTransform(dpr, 0, 0, dpr, ...)) samples the
+    // wrong region of the backing store on any device where dpr != 1 — i.e.
+    // effectively every iPad/iPhone/Android device. That's exactly why the
+    // guide glyph could still render off-center in real use even after
+    // switching from measureText() to pixel-probing: the probing itself was
+    // reading a scaled-down corner of the real ink, not the whole glyph. A
+    // dedicated scratch canvas that's never transformed measures in the same
+    // coordinate space it draws in on every device, always — a canvas
+    // cannot lie about what it actually rendered, and this way it's never
+    // asked to.
+    const pw = Math.max(1, Math.ceil(w));
+    const ph = Math.max(1, Math.ceil(h));
+    const probeCanvas = document.createElement("canvas");
+    probeCanvas.width = pw;
+    probeCanvas.height = ph;
+    const ctx = probeCanvas.getContext("2d");
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
 
@@ -533,12 +567,12 @@
     // its ink actually landed. Always clears ctx before returning so the
     // caller (or the next probe) starts from a clean canvas.
     function probeInk(size, ax, ay) {
-      ctx.clearRect(0, 0, w, h);
+      ctx.clearRect(0, 0, pw, ph);
       ctx.font = `900 ${size}px "Noto Sans Telugu", sans-serif`;
       ctx.fillStyle = "#000";
       ctx.fillText(telugu, ax, ay);
-      const box = inkBBox(ctx.getImageData(0, 0, w, h).data, w, h);
-      ctx.clearRect(0, 0, w, h);
+      const box = inkBBox(ctx.getImageData(0, 0, pw, ph).data, pw, ph);
+      ctx.clearRect(0, 0, pw, ph);
       return box;
     }
 
@@ -588,7 +622,7 @@
     guideCtx.setLineDash([rect.width * 0.018, rect.width * 0.02]);
     guideCtx.strokeStyle = "#C9C6DD";
 
-    const layout = computeGlyphLayout(guideCtx, letter.telugu, rect.width, rect.height);
+    const layout = computeGlyphLayout(letter.telugu, rect.width, rect.height);
     guideCtx.font = `900 ${layout.size}px "Noto Sans Telugu", sans-serif`;
     guideCtx.textAlign = "center";
     guideCtx.textBaseline = "middle";
@@ -788,7 +822,9 @@
     // (size + anchor) is computed once here, at the guide's own bold weight,
     // and reused as-is for the core mask below — only the font *weight*
     // changes, not the position or size, so the two stay concentric.
-    const layout = computeGlyphLayout(sctx, letter.telugu, SCORE_SIZE, SCORE_SIZE);
+    const layout = computeGlyphLayout(letter.telugu, SCORE_SIZE, SCORE_SIZE);
+    sctx.textAlign = "center";
+    sctx.textBaseline = "middle";
     sctx.font = `900 ${layout.size}px "Noto Sans Telugu", sans-serif`;
     sctx.fillStyle = "#000";
     sctx.fillText(letter.telugu, layout.anchorX, layout.anchorY);
@@ -967,20 +1003,19 @@
   // barely denting a real letter, where both numbers are already high
   // (0.9 x 0.95 stays 0.85).
   //
-  // shape is blended in as a separate factor on top of that product, scaled
-  // between SHAPE_SCORE_FLOOR and 1 rather than 0 and 1 — unlike
-  // coverage/precision, shape is a *pattern* comparison over a fairly coarse
-  // grid, so it's naturally noisier for very short/thin glyphs (a couple of
-  // pixels' difference can shift a whole zone's count). Letting it multiply
-  // in from 0 would risk that noise capping an otherwise-excellent trace's
-  // score; a floor keeps its effect proportionate — a strong shape match
-  // still visibly lifts the score, a poor one (a scribble) still visibly
-  // costs it, but it can never on its own be the difference between a great
-  // score and a near-zero one the way coverage/precision can.
+  // shape is blended in as a third factor on top of that product, as
+  // shape^SHAPE_SCORE_EXPONENT (see the constant's comment above for why
+  // this replaced an earlier, too-forgiving floor-based version) — a
+  // scribble that fills most of the box can still rack up coverage=1.0
+  // (every core pixel sits under solid ink) and moderate-to-good precision
+  // purely by covering a lot of ground, exactly the "kind of everywhere"
+  // trick coverage/precision alone can't catch; squaring shape gives that
+  // case a real, steep penalty while barely denting a real letter, where
+  // shape is already high (0.95 squared is still 0.9).
   function percentScore(result) {
     if (!result || result.drawCount < MIN_INK_PIXELS) return 0;
     const { coverage, precision, shape } = result;
-    const shapeFactor = SHAPE_SCORE_FLOOR + (1 - SHAPE_SCORE_FLOOR) * (shape || 0);
+    const shapeFactor = Math.pow(Math.max(0, shape || 0), SHAPE_SCORE_EXPONENT);
     return Math.round(coverage * precision * shapeFactor * 100);
   }
 
@@ -1328,7 +1363,7 @@
     paintPerfectFillForTest: () => {
       const letter = currentLetter();
       const rect = guideCanvas.getBoundingClientRect();
-      const layout = computeGlyphLayout(drawCtx, letter.telugu, rect.width, rect.height);
+      const layout = computeGlyphLayout(letter.telugu, rect.width, rect.height);
       drawCtx.font = `900 ${layout.size}px "Noto Sans Telugu", sans-serif`;
       drawCtx.textAlign = "center";
       drawCtx.textBaseline = "middle";
@@ -1347,7 +1382,7 @@
     paintWeightedFillForTest: (weight, jitterFrac) => {
       const letter = currentLetter();
       const rect = guideCanvas.getBoundingClientRect();
-      const layout = computeGlyphLayout(drawCtx, letter.telugu, rect.width, rect.height);
+      const layout = computeGlyphLayout(letter.telugu, rect.width, rect.height);
       const jitter = (jitterFrac || 0) * rect.width;
       const jx = (Math.random() * 2 - 1) * jitter;
       const jy = (Math.random() * 2 - 1) * jitter;
@@ -1365,7 +1400,7 @@
     paintScaledFillForTest: (scale, offsetXFrac, offsetYFrac) => {
       const letter = currentLetter();
       const rect = guideCanvas.getBoundingClientRect();
-      const layout = computeGlyphLayout(drawCtx, letter.telugu, rect.width, rect.height);
+      const layout = computeGlyphLayout(letter.telugu, rect.width, rect.height);
       const size = layout.size * scale;
       drawCtx.font = `900 ${size}px "Noto Sans Telugu", sans-serif`;
       drawCtx.textAlign = "center";
@@ -1383,7 +1418,7 @@
     paintDistortedFillForTest: (scaleX, scaleY, offsetXFrac, offsetYFrac) => {
       const letter = currentLetter();
       const rect = guideCanvas.getBoundingClientRect();
-      const layout = computeGlyphLayout(drawCtx, letter.telugu, rect.width, rect.height);
+      const layout = computeGlyphLayout(letter.telugu, rect.width, rect.height);
       const cx = layout.anchorX + rect.width * (offsetXFrac || 0);
       const cy = layout.anchorY + rect.height * (offsetYFrac || 0);
       drawCtx.save();
@@ -1410,7 +1445,7 @@
     paintRealisticStrokeForTest: (jitterFrac) => {
       const letter = currentLetter();
       const rect = guideCanvas.getBoundingClientRect();
-      const layout = computeGlyphLayout(drawCtx, letter.telugu, rect.width, rect.height);
+      const layout = computeGlyphLayout(letter.telugu, rect.width, rect.height);
       const jitter = (jitterFrac || 0) * rect.width;
       drawCtx.save();
       if (jitter > 0) {
